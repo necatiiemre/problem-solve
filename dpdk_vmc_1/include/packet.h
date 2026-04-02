@@ -489,9 +489,32 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
            padded_payload_len, pkt_len, payload_off);
     printf("  From IP total_len:  %u bytes (ip_total_len %u - IP(20) - UDP(8))\n",
            real_payload_len, ip_total_len_val);
-    if (padding_bytes > 0)
-        printf("  *** PADDING DETECTED: %u bytes (switch/NIC ekledi, son %u byte 0x00) ***\n",
-               padding_bytes, padding_bytes);
+    if (padding_bytes > 0) {
+        printf("  *** PADDING DETECTED: %u bytes (switch/NIC ekledi) ***\n", padding_bytes);
+        // Son 32 byte'i goster: gercek payload sonu + padding
+        uint16_t tail_start = (real_payload_len > 16) ? (real_payload_len - 16) : 0;
+        uint16_t tail_end = padded_payload_len;
+        const uint8_t *pb = pkt + payload_off;
+        printf("  PAYLOAD TAIL (offset %u..%u, | = gercek payload sonu):\n", tail_start, tail_end - 1);
+        printf("    ");
+        for (uint16_t i = tail_start; i < tail_end; i++) {
+            if (i == real_payload_len)
+                printf("| ");
+            printf("%02x ", pb[i]);
+        }
+        printf("\n");
+        printf("    ");
+        for (uint16_t i = tail_start; i < tail_end; i++) {
+            if (i == real_payload_len)
+                printf("^ ");
+            else if (i < real_payload_len)
+                printf(".. ");
+            else
+                printf("PP ");
+        }
+        printf("\n");
+        printf("    (.. = gercek veri, PP = padding, | = sinir)\n");
+    }
 
     const uint8_t *payload_base = pkt + payload_off;
     uint16_t payload_len = real_payload_len;  // Use real length, not padded
