@@ -517,7 +517,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     }
 
     const uint8_t *payload_base = pkt + payload_off;
-    uint16_t payload_len = real_payload_len;  // Use real length, not padded
+    uint16_t payload_len = padded_payload_len;  // pkt_len tabanli, ham gercek
 
     // Sequence number
     uint64_t seq;
