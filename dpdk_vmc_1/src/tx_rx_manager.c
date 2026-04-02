@@ -1690,7 +1690,11 @@ int rx_worker(void *arg)
                         // PRBS verification on remaining payload (skip 68 bytes)
                         uint8_t *cross_recv = cross_payload + SEQ_BYTES + SPLITMIX_TOTAL_OVERHEAD;
 #if IMIX_ENABLED
-                        uint16_t cross_total = m->pkt_len - l2_len_vlan - 20 - 8 - SEQ_BYTES;
+                        // IP total_length kullanarak gercek payload (padding haric)
+                        const struct rte_ipv4_hdr *cross_ip = (const struct rte_ipv4_hdr *)(pkt + l2_len_vlan);
+                        uint16_t cross_ip_total = rte_be_to_cpu_16(cross_ip->total_length);
+                        uint16_t cross_total = (cross_ip_total > 20 + 8 + SEQ_BYTES)
+                            ? (cross_ip_total - 20 - 8 - SEQ_BYTES) : 0;
                         if (cross_total > MAX_PRBS_BYTES) cross_total = MAX_PRBS_BYTES;
                         // Son byte DTN seq olduğu için PRBS kontrolünden 1 byte düş
                         uint16_t cross_check_len = (cross_total > SPLITMIX_TOTAL_OVERHEAD + 1)
@@ -1767,9 +1771,11 @@ int rx_worker(void *arg)
                         uint64_t ext_seq = *(uint64_t *)(pkt + payload_off);
 
 #if IMIX_ENABLED
-                        // IMIX: PRBS offset hesabı HEP MAX_PRBS_BYTES ile yapılır
-                        // PRBS boyutu paket boyutundan hesaplanır
-                        uint16_t ext_prbs_len = m->pkt_len - l2_len_vlan - 20 - 8 - SEQ_BYTES;
+                        // IMIX: IP total_length kullanarak gercek payload (padding haric)
+                        const struct rte_ipv4_hdr *ext_ip = (const struct rte_ipv4_hdr *)(pkt + l2_len_vlan);
+                        uint16_t ext_ip_total = rte_be_to_cpu_16(ext_ip->total_length);
+                        uint16_t ext_prbs_len = (ext_ip_total > 20 + 8 + SEQ_BYTES)
+                            ? (ext_ip_total - 20 - 8 - SEQ_BYTES) : 0;
                         if (ext_prbs_len > MAX_PRBS_BYTES) ext_prbs_len = MAX_PRBS_BYTES;
 
                         uint64_t prbs_offset = (ext_seq * (uint64_t)MAX_PRBS_BYTES) % 268435456ULL;
@@ -1961,7 +1967,12 @@ int rx_worker(void *arg)
                 uint8_t *recv = payload_base + SEQ_BYTES + SPLITMIX_TOTAL_OVERHEAD;
 
 #if IMIX_ENABLED
-                uint16_t total_prbs_len = m->pkt_len - l2_len_vlan - 20 - 8 - SEQ_BYTES;
+                // IP total_length kullanarak gercek payload boyutunu hesapla
+                // (switch/NIC padding'i haric tutar)
+                const struct rte_ipv4_hdr *rx_ip = (const struct rte_ipv4_hdr *)(pkt + l2_len_vlan);
+                uint16_t rx_ip_total = rte_be_to_cpu_16(rx_ip->total_length);
+                uint16_t total_prbs_len = (rx_ip_total > 20 + 8 + SEQ_BYTES)
+                    ? (rx_ip_total - 20 - 8 - SEQ_BYTES) : 0;
                 if (total_prbs_len > MAX_PRBS_BYTES) total_prbs_len = MAX_PRBS_BYTES;
                 // Son byte DTN seq olduğu için PRBS kontrolünden 1 byte düş
                 uint16_t prbs_check_len = (total_prbs_len > SPLITMIX_TOTAL_OVERHEAD + 1)

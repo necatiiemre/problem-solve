@@ -474,12 +474,27 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     uint16_t udp_len = ((uint16_t)pkt[udp_off + 4] << 8) | pkt[udp_off + 5];
     printf("  UDP: src=%u dst=%u len=%u\n", udp_src, udp_dst, udp_len);
 
+    // --- Compute real payload size from IP total_length (excludes padding) ---
+    uint16_t ip_total_len_val = ((uint16_t)pkt[l3_off + 2] << 8) | pkt[l3_off + 3];
+    // Real payload = IP total_length - IP header(20) - UDP header(8)
+    uint16_t real_payload_len = (ip_total_len_val > 28) ? (ip_total_len_val - 28) : 0;
+    uint16_t padded_payload_len = pkt_len - payload_off;
+    uint16_t padding_bytes = (padded_payload_len > real_payload_len) ?
+                              (padded_payload_len - real_payload_len) : 0;
+
     // --- Payload ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ PAYLOAD (offset %u, %u bytes):\n", payload_off, pkt_len - payload_off);
+    printf("║ PAYLOAD (offset %u):\n", payload_off);
+    printf("  From pkt_len:       %u bytes (pkt_len %u - headers %u)\n",
+           padded_payload_len, pkt_len, payload_off);
+    printf("  From IP total_len:  %u bytes (ip_total_len %u - IP(20) - UDP(8))\n",
+           real_payload_len, ip_total_len_val);
+    if (padding_bytes > 0)
+        printf("  *** PADDING DETECTED: %u bytes (switch/NIC ekledi, son %u byte 0x00) ***\n",
+               padding_bytes, padding_bytes);
 
     const uint8_t *payload_base = pkt + payload_off;
-    uint16_t payload_len = pkt_len - payload_off;
+    uint16_t payload_len = real_payload_len;  // Use real length, not padded
 
     // Sequence number
     uint64_t seq;
