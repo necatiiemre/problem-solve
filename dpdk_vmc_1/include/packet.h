@@ -474,50 +474,90 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     uint16_t udp_len = ((uint16_t)pkt[udp_off + 4] << 8) | pkt[udp_off + 5];
     printf("  UDP: src=%u dst=%u len=%u\n", udp_src, udp_dst, udp_len);
 
-    // --- Compute real payload size from IP total_length (excludes padding) ---
+    // --- Boyut analizi ---
     uint16_t ip_total_len_val = ((uint16_t)pkt[l3_off + 2] << 8) | pkt[l3_off + 3];
-    // Real payload = IP total_length - IP header(20) - UDP header(8)
-    uint16_t real_payload_len = (ip_total_len_val > 28) ? (ip_total_len_val - 28) : 0;
-    uint16_t padded_payload_len = pkt_len - payload_off;
-    uint16_t padding_bytes = (padded_payload_len > real_payload_len) ?
-                              (padded_payload_len - real_payload_len) : 0;
+    uint16_t payload_from_ip = (ip_total_len_val > 28) ? (ip_total_len_val - 28) : 0;
+    uint16_t payload_from_pktlen = pkt_len - payload_off;
+    uint16_t nic_padding = (payload_from_pktlen > payload_from_ip) ?
+                            (payload_from_pktlen - payload_from_ip) : 0;
+    // VMC_1 TX beklenen boyutlar
+    uint16_t tx_expected_pktlen = has_vlan ? PACKET_SIZE_VLAN : PACKET_SIZE_NO_VLAN;
+    uint16_t tx_expected_payload = has_vlan ? PAYLOAD_SIZE_VLAN : PAYLOAD_SIZE_NO_VLAN;
+    uint16_t tx_expected_iptotal = tx_expected_payload + 20 + 8;
+    uint16_t device_added = (ip_total_len_val > tx_expected_iptotal) ?
+                             (ip_total_len_val - tx_expected_iptotal) : 0;
+    uint16_t total_extra = payload_from_pktlen - tx_expected_payload;
 
     // --- Payload ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ PAYLOAD (offset %u):\n", payload_off);
-    printf("  From pkt_len:       %u bytes (pkt_len %u - headers %u)\n",
-           padded_payload_len, pkt_len, payload_off);
-    printf("  From IP total_len:  %u bytes (ip_total_len %u - IP(20) - UDP(8))\n",
-           real_payload_len, ip_total_len_val);
-    if (padding_bytes > 0) {
-        printf("  *** PADDING DETECTED: %u bytes (switch/NIC ekledi) ***\n", padding_bytes);
-        // Son 32 byte'i goster: gercek payload sonu + padding
-        uint16_t tail_start = (real_payload_len > 16) ? (real_payload_len - 16) : 0;
-        uint16_t tail_end = padded_payload_len;
+    printf("║ PAYLOAD BOYUT ANALIZI:\n");
+    printf("  ┌─────────────────────────────────────────────────────────┐\n");
+    printf("  │ VMC_1 TX beklenen:                                     │\n");
+    printf("  │   pkt_len      = %u bytes                             │\n", tx_expected_pktlen);
+    printf("  │   ip_total_len = %u                                  │\n", tx_expected_iptotal);
+    printf("  │   payload      = %u bytes (SEQ:8 + PRBS:%u)       │\n",
+           tx_expected_payload, tx_expected_payload - SEQ_BYTES);
+    printf("  │                                                         │\n");
+    printf("  │ Gelen paket (RX):                                      │\n");
+    printf("  │   pkt_len      = %u bytes                             │\n", pkt_len);
+    printf("  │   ip_total_len = %u                                  │\n", ip_total_len_val);
+    printf("  │   payload      = %u bytes (pkt_len'den)              │\n", payload_from_pktlen);
+    printf("  │                                                         │\n");
+    printf("  │ FARK ANALIZI:  (toplam %u byte fazla)                  │\n", total_extra);
+    if (device_added > 0)
+    printf("  │   Cihaz ekledi:     +%u bytes (ip_total: %u -> %u)  │\n",
+           device_added, tx_expected_iptotal, ip_total_len_val);
+    if (nic_padding > 0)
+    printf("  │   NIC/Switch pad:   +%u byte  (pkt_len vs ip_total)    │\n", nic_padding);
+    if (total_extra == 0)
+    printf("  │   Fark yok - boyutlar esit                             │\n");
+    printf("  └─────────────────────────────────────────────────────────┘\n");
+
+    if (total_extra > 0) {
+        printf("  *** SONUC: Gelen paket TX'ten %u byte buyuk! ***\n", total_extra);
+        printf("  ***   %u byte cihaz buyuttugu + %u byte NIC padding  ***\n", device_added, nic_padding);
+        printf("  ***   Bu ekstra byte'lar 0x00 olarak gelir ve PRBS    ***\n");
+        printf("  ***   kontrolunde FAIL'e neden olur (bizim hatamiz    ***\n");
+        printf("  ***   degil, karsi taraf paketi buyutuyor).           ***\n");
+    }
+
+    // Payload tail: son byte'lar
+    if (total_extra > 0) {
         const uint8_t *pb = pkt + payload_off;
-        printf("  PAYLOAD TAIL (offset %u..%u, | = gercek payload sonu):\n", tail_start, tail_end - 1);
-        printf("    ");
+        // TX payload sinirini goster
+        printf("  PAYLOAD TAIL (TX siniri=%u, gelen=%u):\n", tx_expected_payload, payload_from_pktlen);
+        uint16_t tail_start = (tx_expected_payload > 16) ? (tx_expected_payload - 16) : 0;
+        uint16_t tail_end = payload_from_pktlen;
+        printf("    offset: ");
         for (uint16_t i = tail_start; i < tail_end; i++) {
-            if (i == real_payload_len)
-                printf("| ");
-            printf("%02x ", pb[i]);
+            if (i == tx_expected_payload) printf("│ ");
+            if (i == payload_from_ip)     printf("│ ");
+            printf("%4u ", i);
         }
-        printf("\n");
-        printf("    ");
+        printf("\n    data:   ");
         for (uint16_t i = tail_start; i < tail_end; i++) {
-            if (i == real_payload_len)
-                printf("^ ");
-            else if (i < real_payload_len)
-                printf(".. ");
+            if (i == tx_expected_payload) printf("│ ");
+            if (i == payload_from_ip)     printf("│ ");
+            printf("  %02x ", pb[i]);
+        }
+        printf("\n    kaynak: ");
+        for (uint16_t i = tail_start; i < tail_end; i++) {
+            if (i == tx_expected_payload) printf("│ ");
+            if (i == payload_from_ip)     printf("│ ");
+            if (i < tx_expected_payload)
+                printf(" VMC ");
+            else if (i < payload_from_ip)
+                printf(" CHz ");
             else
-                printf("PP ");
+                printf(" PAD ");
         }
         printf("\n");
-        printf("    (.. = gercek veri, PP = padding, | = sinir)\n");
+        printf("    (VMC = bizim veri, CHz = cihaz ekledi, PAD = NIC padding)\n");
+        printf("    (│ = sinir isaretleri: ilk=TX payload sonu, ikinci=IP total_len sonu)\n");
     }
 
     const uint8_t *payload_base = pkt + payload_off;
-    uint16_t payload_len = padded_payload_len;  // pkt_len tabanli, ham gercek
+    uint16_t payload_len = payload_from_pktlen;  // pkt_len tabanli
 
     // Sequence number
     uint64_t seq;
@@ -525,18 +565,30 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     printf("  SEQ:     %" PRIu64 " (0x%016" PRIX64 ")\n", seq, seq);
 
     uint16_t total_prbs_len = (payload_len > SEQ_BYTES) ? payload_len - SEQ_BYTES : 0;
-    printf("  Total PRBS area: %u bytes (payload %u - seq %u)\n",
-           total_prbs_len, payload_len, SEQ_BYTES);
+    uint16_t tx_prbs_len = tx_expected_payload - SEQ_BYTES;  // VMC_1'in gonderdigi PRBS
+    printf("  PRBS alani:  %u bytes (pkt_len'den)\n", total_prbs_len);
+    printf("  PRBS (TX):   %u bytes (VMC_1'in gonderdigi gercek PRBS)\n", tx_prbs_len);
+    if (total_prbs_len != tx_prbs_len)
+        printf("  *** PRBS alani TX'ten %u byte buyuk! ***\n", total_prbs_len - tx_prbs_len);
 
     // Memory layout
-    printf("║ PAYLOAD MEMORY LAYOUT:\n");
-    printf("  [%u..%u]   SEQ        (8 bytes)\n", 0, 7);
-    printf("  [%u..%u]  XOR'd zone (64 bytes) - splitmix64 tarafindan XOR'lanmis olmali\n", 8, 71);
-    printf("  [%u..%u]  CRC32C     (4 bytes)\n", 72, 75);
-    if (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1)
-        printf("  [%u..%u] Saf PRBS   (%u bytes)\n", 76, (uint16_t)(payload_len - 2),
-               total_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1);
-    printf("  [%u]        DTN SEQ   (1 byte)\n", payload_len - 1);
+    printf("║ PAYLOAD MEMORY MAP:\n");
+    printf("  [%u..%u]     SEQ            (8 bytes)\n", 0, 7);
+    printf("  [%u..%u]    XOR zone       (64 bytes) - splitmix64 XOR alani\n", 8, 71);
+    printf("  [%u..%u]    CRC32C         (4 bytes)\n", 72, 75);
+    uint16_t saf_prbs_from_tx = tx_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1;
+    uint16_t saf_prbs_from_pkt = (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1) ?
+        total_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1 : 0;
+    printf("  [%u..%u]  Saf PRBS       (%u bytes - VMC_1 gercek veri)\n",
+           76, 76 + saf_prbs_from_tx - 1, saf_prbs_from_tx);
+    if (saf_prbs_from_pkt > saf_prbs_from_tx)
+        printf("  [%u..%u]  *** EKSTRA ***  (%u bytes - cihaz+NIC ekledi, 0x00 olur)\n",
+               76 + saf_prbs_from_tx, 76 + saf_prbs_from_pkt - 1,
+               saf_prbs_from_pkt - saf_prbs_from_tx);
+    printf("  [%u]          DTN SEQ        (1 byte) - pkt_len'e gore\n", payload_len - 1);
+    if (total_extra > 0)
+        printf("  *** NOT: DTN byte gercekte [%u] offset'inde (TX payload siniri) ***\n",
+               tx_expected_payload - 1);
 
     // Full payload hex dump (first 256 bytes for readability)
     trace_hexdump("RAW PAYLOAD", payload_base, payload_len, 256);
@@ -603,16 +655,19 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     // --- PRBS Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ PRBS-31 VERIFICATION (saf PRBS bolumu):\n");
-    printf("  Zone: payload[76..%u] (overhead=%u skip, son 1B=DTN_SEQ)\n",
-           payload_len - 2, TRACE_SPLITMIX_TOTAL_OVERHEAD);
 
     if (cache_valid) {
         const uint8_t *recv_prbs = payload_base + SEQ_BYTES + TRACE_SPLITMIX_TOTAL_OVERHEAD;
         const uint8_t *exp_prbs = port_prbs_cache[port_id].cache_ext + prbs_off + TRACE_SPLITMIX_TOTAL_OVERHEAD;
         uint16_t prbs_check_len = (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1)
             ? total_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1 : 0;
-        printf("  PRBS check length: %u bytes\n", prbs_check_len);
-        printf("  Expected from: cache_ext[%" PRIu64 " + %u] = cache_ext[%" PRIu64 "]\n",
+        uint16_t tx_prbs_check = saf_prbs_from_tx;  // VMC_1'in gonderdigi saf PRBS
+        printf("  Kontrol edilen:  %u bytes (pkt_len bazli)\n", prbs_check_len);
+        printf("  TX gercek PRBS:  %u bytes (VMC_1'in gonderdigi)\n", tx_prbs_check);
+        if (prbs_check_len > tx_prbs_check)
+            printf("  *** SON %u BYTE TX SINIRININ OTESINDE (cihaz+NIC kaynaklı) ***\n",
+                   prbs_check_len - tx_prbs_check);
+        printf("  PRBS cache:  cache_ext[%" PRIu64 " + %u] = cache_ext[%" PRIu64 "]\n",
                prbs_off, TRACE_SPLITMIX_TOTAL_OVERHEAD,
                prbs_off + TRACE_SPLITMIX_TOTAL_OVERHEAD);
 
@@ -626,8 +681,32 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             for (uint16_t i = 0; i < show_len; i++) printf("%02x ", exp_prbs[i]);
             printf("\n");
 
+            // TX siniri icindeki PRBS kontrolu
+            uint16_t tx_match = 0;
+            for (uint16_t i = 0; i < tx_prbs_check && i < prbs_check_len; i++)
+                if (recv_prbs[i] == exp_prbs[i]) tx_match++;
+            printf("  TX PRBS (%u byte): %u/%u match %s\n",
+                   tx_prbs_check, tx_match, tx_prbs_check,
+                   (tx_match == tx_prbs_check) ? "-> GERCEK VERI TAMAMEN DOGRU" :
+                   "-> *** GERCEK VERIDE HATA VAR ***");
+
+            // Ekstra byte'lar
+            if (prbs_check_len > tx_prbs_check) {
+                uint16_t extra_start = tx_prbs_check;
+                uint16_t extra_count = prbs_check_len - tx_prbs_check;
+                printf("  EKSTRA BYTE'LAR (offset %u..%u, %u byte, TX sinirinin OTESI):\n",
+                       extra_start, prbs_check_len - 1, extra_count);
+                printf("    ");
+                for (uint16_t i = extra_start; i < prbs_check_len; i++)
+                    printf("[%u] recv=0x%02x exp=0x%02x ", i, recv_prbs[i], exp_prbs[i]);
+                printf("\n");
+                printf("    *** Bunlar VMC_1'in GONDERMEDIGI byte'lar.          ***\n");
+                printf("    *** Cihaz/NIC paketi buyuttugu icin burada 0x00 var. ***\n");
+                printf("    *** Bu PRBS FAIL'in GERCEK SEBEBI budur.            ***\n");
+            }
+
             // Detailed comparison with mismatch positions
-            trace_compare("PRBS compare", recv_prbs, exp_prbs, prbs_check_len, 16);
+            trace_compare("PRBS compare (tam)", recv_prbs, exp_prbs, prbs_check_len, 16);
         } else {
             printf("  *** PRBS check length is 0, nothing to verify ***\n");
         }
@@ -657,11 +736,39 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     bool sm_ok_final = cache_valid ? trace_verify_splitmix64(payload_base, seq, port_id) : false;
     bool prbs_ok_final = cache_valid ? trace_verify_prbs(payload_base, seq, port_id, total_prbs_len) : false;
-    printf("║ SUMMARY: CRC32C=%s  SPLIT64=%s  PRBS=%s  DTN=%s\n",
-           crc_ok ? "OK" : "FAIL",
-           sm_ok_final ? "OK" : "FAIL",
-           prbs_ok_final ? "OK" : "FAIL",
-           (dtn_actual == dtn_expected) ? "OK" : "FAIL");
+
+    // TX siniri icinde PRBS kontrolu (ekstra byte'lar haric)
+    bool prbs_tx_ok = false;
+    if (cache_valid) {
+        const uint8_t *r = payload_base + SEQ_BYTES + TRACE_SPLITMIX_TOTAL_OVERHEAD;
+        const uint8_t *e = port_prbs_cache[port_id].cache_ext + prbs_off + TRACE_SPLITMIX_TOTAL_OVERHEAD;
+        prbs_tx_ok = (saf_prbs_from_tx == 0) || (memcmp(r, e, saf_prbs_from_tx) == 0);
+    }
+
+    printf("║ SUMMARY:\n");
+    printf("║   CRC32C  = %s", crc_ok ? "OK" : "FAIL");
+    if (!crc_ok) printf("  (VMC_2 transform yok, beklenen)");
+    printf("\n");
+    printf("║   SPLIT64 = %s", sm_ok_final ? "OK" : "FAIL");
+    if (!sm_ok_final) printf("  (VMC_2 transform yok, beklenen)");
+    printf("\n");
+    printf("║   PRBS    = %s", prbs_ok_final ? "OK" : "FAIL");
+    if (!prbs_ok_final && prbs_tx_ok && total_extra > 0)
+        printf("  (SADECE cihaz/NIC ekstra byte'lari yuzunden FAIL!)");
+    else if (!prbs_ok_final && !prbs_tx_ok)
+        printf("  (*** GERCEK PRBS HATASI - TX verisi bozuk ***)");
+    printf("\n");
+    if (prbs_tx_ok && !prbs_ok_final)
+        printf("║   PRBS(TX siniri icinde) = OK  <-- VMC_1 verisi %u/%u byte dogru\n",
+               saf_prbs_from_tx, saf_prbs_from_tx);
+    printf("║   DTN_SEQ = %s\n", (dtn_actual == dtn_expected) ? "OK" : "FAIL");
+    if (total_extra > 0) {
+        printf("║\n");
+        printf("║   *** SONUC: Paket %u byte buyutulmus (cihaz:%u + NIC:%u) ***\n",
+               total_extra, device_added, nic_padding);
+        printf("║   *** PRBS FAIL sadece bu ekstra byte'lardan kaynakli. ***\n");
+        printf("║   *** VMC_1'in gonderdigi %u byte PRBS tamamen dogru. ***\n", saf_prbs_from_tx);
+    }
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 }
 
