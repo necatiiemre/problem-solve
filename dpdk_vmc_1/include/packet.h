@@ -370,98 +370,261 @@ static inline bool trace_verify_prbs(const uint8_t *payload_base,
     return (check_len == 0) || (memcmp(recv, exp, check_len) == 0);
 }
 
+// Helper: hex dump with offset labels, 16 bytes per line
+static inline void trace_hexdump(const char *label, const uint8_t *data,
+                                  uint16_t len, uint16_t max_bytes)
+{
+    uint16_t dump_len = (len < max_bytes) ? len : max_bytes;
+    printf("  %s (%u bytes, showing %u):\n", label, len, dump_len);
+    for (uint16_t i = 0; i < dump_len; i += 16) {
+        printf("    [%04u] ", i);
+        for (uint16_t j = i; j < i + 16 && j < dump_len; j++)
+            printf("%02x ", data[j]);
+        printf("\n");
+    }
+    if (dump_len < len)
+        printf("    ... (%u bytes truncated)\n", len - dump_len);
+}
+
+// Helper: side-by-side comparison of received vs expected, show first N mismatches
+static inline void trace_compare(const char *label, const uint8_t *recv,
+                                  const uint8_t *exp, uint16_t len,
+                                  uint16_t max_mismatches)
+{
+    uint16_t mismatch_count = 0;
+    int first_mismatch = -1;
+    for (uint16_t i = 0; i < len; i++) {
+        if (recv[i] != exp[i]) {
+            if (first_mismatch < 0) first_mismatch = i;
+            mismatch_count++;
+        }
+    }
+    printf("  %s: %u/%u bytes match", label, len - mismatch_count, len);
+    if (mismatch_count == 0) {
+        printf(" -> ALL OK\n");
+        return;
+    }
+    printf(" -> %u MISMATCHES (first at offset %d)\n", mismatch_count, first_mismatch);
+
+    // Show mismatches around first_mismatch
+    uint16_t shown = 0;
+    for (uint16_t i = 0; i < len && shown < max_mismatches; i++) {
+        if (recv[i] != exp[i]) {
+            printf("    [%04u] recv=0x%02x  exp=0x%02x  XOR=0x%02x\n",
+                   i, recv[i], exp[i], recv[i] ^ exp[i]);
+            shown++;
+        }
+    }
+    if (mismatch_count > max_mismatches)
+        printf("    ... (%u more mismatches)\n", mismatch_count - max_mismatches);
+}
+
 static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
                                        uint16_t pkt_len, uint16_t port_id)
 {
     uint16_t ether_type = ((uint16_t)pkt[12] << 8) | pkt[13];
     int has_vlan = (ether_type == 0x8100);
 
-    printf("[TRACE][%s] Port=%u Len=%u\n", stage, port_id, pkt_len);
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║ [TRACE][%s] Port=%u  PktLen=%u  EtherType=0x%04X (%s)\n",
+           stage, port_id, pkt_len, ether_type, has_vlan ? "VLAN" : "IPv4");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+
+    // --- L2 Header ---
+    printf("║ L2 HEADER:\n");
     printf("  DST MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5]);
     printf("  SRC MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11]);
-
     uint16_t vl_idx = ((uint16_t)pkt[4] << 8) | pkt[5];
-    printf("  VL-IDX:  %u (0x%04X)\n", vl_idx, vl_idx);
+    printf("  VL-IDX:  %u (0x%04X) [from DST MAC bytes 4-5]\n", vl_idx, vl_idx);
 
+    // Compute offsets based on VLAN presence
+    uint16_t l3_off, payload_off;
     if (has_vlan) {
         uint16_t tci = ((uint16_t)pkt[14] << 8) | pkt[15];
         uint16_t vlan_id = tci & 0x0FFF;
-        printf("  VLAN:    %u (TCI=0x%04X)\n", vlan_id, tci);
-        printf("  DST IP:  %u.%u.%u.%u\n", pkt[34], pkt[35], pkt[36], pkt[37]);
-        uint64_t seq;
-        memcpy(&seq, pkt + 46, sizeof(seq));
-        printf("  SEQ:     %" PRIu64 "\n", seq);
-
-        const uint8_t *payload_base = pkt + 46;
-        uint16_t payload_len = pkt_len - 46;
-        uint16_t total_prbs_len = (payload_len > SEQ_BYTES) ? payload_len - SEQ_BYTES : 0;
-
-        // Payload 64 bytes (after SEQ): offset 46+8 = 54
-        printf("  Payload[64B]: ");
-        for (int _ti = 0; _ti < 64; _ti++) printf("%02x ", pkt[54 + _ti]);
-        printf("\n");
-
-        // CRC32C: payload offset 46 + SEQ(8) + XOR(64) = 118
-        uint32_t recv_crc;
-        memcpy(&recv_crc, pkt + 118, sizeof(recv_crc));
-        uint32_t calc_crc = trace_sw_crc32c(payload_base, SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES);
-        bool crc_ok = (calc_crc == recv_crc);
-        printf("  CRC32C:  0x%08X (calc: 0x%08X) %s\n", recv_crc, calc_crc,
-               crc_ok ? "OK" : "FAIL");
-
-        // Splitmix64 verification
-        bool sm_ok = trace_verify_splitmix64(payload_base, seq, port_id);
-        printf("  SPLIT64: %s\n", sm_ok ? "OK" : "FAIL");
-
-        // PRBS verification
-        bool prbs_ok = trace_verify_prbs(payload_base, seq, port_id, total_prbs_len);
-        printf("  PRBS:    %s\n", prbs_ok ? "OK" : "FAIL");
-
-        // DTN Sequence Number (payload son byte)
-        uint8_t dtn_actual = pkt[pkt_len - 1];
-        uint8_t dtn_expected = calc_dtn_seq(seq);
-        printf("  DTN_SEQ: %u (expected: %u) %s\n", dtn_actual, dtn_expected,
-               (dtn_actual == dtn_expected) ? "OK" : "MISMATCH");
+        uint16_t vlan_prio = (tci >> 13) & 0x7;
+        uint16_t inner_type = ((uint16_t)pkt[16] << 8) | pkt[17];
+        printf("  VLAN:    ID=%u  Priority=%u  TCI=0x%04X  InnerType=0x%04X\n",
+               vlan_id, vlan_prio, tci, inner_type);
+        l3_off = 18;  // ETH(14) + VLAN(4)
     } else {
-        printf("  DST IP:  %u.%u.%u.%u\n", pkt[30], pkt[31], pkt[32], pkt[33]);
-        uint64_t seq;
-        memcpy(&seq, pkt + 42, sizeof(seq));
-        printf("  SEQ:     %" PRIu64 "\n", seq);
-
-        const uint8_t *payload_base = pkt + 42;
-        uint16_t payload_len = pkt_len - 42;
-        uint16_t total_prbs_len = (payload_len > SEQ_BYTES) ? payload_len - SEQ_BYTES : 0;
-
-        // Payload 64 bytes (after SEQ): offset 42+8 = 50
-        printf("  Payload[64B]: ");
-        for (int _ti = 0; _ti < 64; _ti++) printf("%02x ", pkt[50 + _ti]);
-        printf("\n");
-
-        // CRC32C: payload offset 42 + SEQ(8) + XOR(64) = 114
-        uint32_t recv_crc;
-        memcpy(&recv_crc, pkt + 114, sizeof(recv_crc));
-        uint32_t calc_crc = trace_sw_crc32c(payload_base, SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES);
-        bool crc_ok = (calc_crc == recv_crc);
-        printf("  CRC32C:  0x%08X (calc: 0x%08X) %s\n", recv_crc, calc_crc,
-               crc_ok ? "OK" : "FAIL");
-
-        // Splitmix64 verification
-        bool sm_ok = trace_verify_splitmix64(payload_base, seq, port_id);
-        printf("  SPLIT64: %s\n", sm_ok ? "OK" : "FAIL");
-
-        // PRBS verification
-        bool prbs_ok = trace_verify_prbs(payload_base, seq, port_id, total_prbs_len);
-        printf("  PRBS:    %s\n", prbs_ok ? "OK" : "FAIL");
-
-        // DTN Sequence Number (payload son byte)
-        uint8_t dtn_actual = pkt[pkt_len - 1];
-        uint8_t dtn_expected = calc_dtn_seq(seq);
-        printf("  DTN_SEQ: %u (expected: %u) %s\n", dtn_actual, dtn_expected,
-               (dtn_actual == dtn_expected) ? "OK" : "MISMATCH");
+        l3_off = 14;  // ETH(14)
     }
-    printf("\n");
+    payload_off = l3_off + 20 + 8;  // +IP(20) +UDP(8)
+
+    // --- L3/L4 Header ---
+    printf("║ L3/L4 HEADER (offset %u):\n", l3_off);
+    // IP
+    uint8_t ip_ver_ihl = pkt[l3_off];
+    uint16_t ip_total_len = ((uint16_t)pkt[l3_off + 2] << 8) | pkt[l3_off + 3];
+    uint8_t ip_ttl = pkt[l3_off + 8];
+    uint8_t ip_proto = pkt[l3_off + 9];
+    printf("  IP:  ver=%u ihl=%u total_len=%u ttl=%u proto=%u\n",
+           ip_ver_ihl >> 4, ip_ver_ihl & 0xF, ip_total_len, ip_ttl, ip_proto);
+    printf("  SRC IP:  %u.%u.%u.%u\n",
+           pkt[l3_off + 12], pkt[l3_off + 13], pkt[l3_off + 14], pkt[l3_off + 15]);
+    printf("  DST IP:  %u.%u.%u.%u\n",
+           pkt[l3_off + 16], pkt[l3_off + 17], pkt[l3_off + 18], pkt[l3_off + 19]);
+    // UDP
+    uint16_t udp_off = l3_off + 20;
+    uint16_t udp_src = ((uint16_t)pkt[udp_off] << 8) | pkt[udp_off + 1];
+    uint16_t udp_dst = ((uint16_t)pkt[udp_off + 2] << 8) | pkt[udp_off + 3];
+    uint16_t udp_len = ((uint16_t)pkt[udp_off + 4] << 8) | pkt[udp_off + 5];
+    printf("  UDP: src=%u dst=%u len=%u\n", udp_src, udp_dst, udp_len);
+
+    // --- Payload ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ PAYLOAD (offset %u, %u bytes):\n", payload_off, pkt_len - payload_off);
+
+    const uint8_t *payload_base = pkt + payload_off;
+    uint16_t payload_len = pkt_len - payload_off;
+
+    // Sequence number
+    uint64_t seq;
+    memcpy(&seq, payload_base, sizeof(seq));
+    printf("  SEQ:     %" PRIu64 " (0x%016" PRIX64 ")\n", seq, seq);
+
+    uint16_t total_prbs_len = (payload_len > SEQ_BYTES) ? payload_len - SEQ_BYTES : 0;
+    printf("  Total PRBS area: %u bytes (payload %u - seq %u)\n",
+           total_prbs_len, payload_len, SEQ_BYTES);
+
+    // Memory layout
+    printf("║ PAYLOAD MEMORY LAYOUT:\n");
+    printf("  [%u..%u]   SEQ        (8 bytes)\n", 0, 7);
+    printf("  [%u..%u]  XOR'd zone (64 bytes) - splitmix64 tarafindan XOR'lanmis olmali\n", 8, 71);
+    printf("  [%u..%u]  CRC32C     (4 bytes)\n", 72, 75);
+    if (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1)
+        printf("  [%u..%u] Saf PRBS   (%u bytes)\n", 76, (uint16_t)(payload_len - 2),
+               total_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1);
+    printf("  [%u]        DTN SEQ   (1 byte)\n", payload_len - 1);
+
+    // Full payload hex dump (first 256 bytes for readability)
+    trace_hexdump("RAW PAYLOAD", payload_base, payload_len, 256);
+
+    // --- PRBS Cache Info ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ PRBS CACHE INFO:\n");
+    printf("  Verification port_id: %u\n", port_id);
+    uint64_t prbs_off = (seq * (uint64_t)MAX_PRBS_BYTES) % (uint64_t)PRBS_CACHE_SIZE;
+    printf("  PRBS offset: seq(%" PRIu64 ") * MAX_PRBS_BYTES(%u) %% PRBS_CACHE_SIZE(%lu) = %" PRIu64 "\n",
+           seq, MAX_PRBS_BYTES, (unsigned long)PRBS_CACHE_SIZE, prbs_off);
+
+    bool cache_valid = (port_id < MAX_PRBS_CACHE_PORTS &&
+                        port_prbs_cache[port_id].initialized &&
+                        port_prbs_cache[port_id].cache_ext != NULL);
+    printf("  Cache port %u: %s\n", port_id,
+           cache_valid ? "VALID" : "*** INVALID/UNINITIALIZED ***");
+
+    // --- CRC32C Verification ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ CRC32C VERIFICATION:\n");
+    printf("  Input: payload_base[0..71] = SEQ(8B) + XOR_ZONE(64B) = 72 bytes\n");
+    uint32_t calc_crc = trace_sw_crc32c(payload_base, SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES);
+    uint32_t recv_crc;
+    memcpy(&recv_crc, payload_base + SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES, sizeof(recv_crc));
+    bool crc_ok = (calc_crc == recv_crc);
+    printf("  Received CRC32C: 0x%08X (at payload offset 72)\n", recv_crc);
+    printf("  Calculated CRC:  0x%08X\n", calc_crc);
+    printf("  Result: %s\n", crc_ok ? "OK" : "*** FAIL ***");
+
+    // --- Splitmix64 Verification ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ SPLITMIX64 VERIFICATION:\n");
+    printf("  XOR'd zone: payload[8..71] (64 bytes)\n");
+    printf("  Decode: decoded[i] = xored[i] ^ splitmix64(seq + i/8)\n");
+
+    if (cache_valid) {
+        const uint8_t *xored = payload_base + SEQ_BYTES;
+        const uint8_t *orig_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;
+        bool sm_ok = true;
+
+        printf("  Block-by-block (8 blocks x 8 bytes):\n");
+        for (int blk = 0; blk < 8; blk++) {
+            uint64_t sm_key = seq + (uint64_t)blk;
+            uint64_t sm_val = trace_splitmix64(sm_key);
+            uint64_t xored_val, orig_val;
+            memcpy(&xored_val, xored + blk * 8, sizeof(uint64_t));
+            memcpy(&orig_val, orig_prbs + blk * 8, sizeof(uint64_t));
+            uint64_t decoded = xored_val ^ sm_val;
+            bool blk_ok = (decoded == orig_val);
+            if (!blk_ok) sm_ok = false;
+            printf("    [blk %d] sm_key=seq+%d=%" PRIu64 "\n", blk, blk, sm_key);
+            printf("            sm_val  = 0x%016" PRIX64 "\n", sm_val);
+            printf("            xored   = 0x%016" PRIX64 "\n", xored_val);
+            printf("            decoded = 0x%016" PRIX64 " (xored ^ sm_val)\n", decoded);
+            printf("            exp_prbs= 0x%016" PRIX64 " %s\n", orig_val,
+                   blk_ok ? "OK" : "*** MISMATCH ***");
+        }
+        printf("  SPLIT64 Result: %s\n", sm_ok ? "OK" : "*** FAIL ***");
+    } else {
+        printf("  *** SKIP: PRBS cache invalid for port %u ***\n", port_id);
+    }
+
+    // --- PRBS Verification ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ PRBS-31 VERIFICATION (saf PRBS bolumu):\n");
+    printf("  Zone: payload[76..%u] (overhead=%u skip, son 1B=DTN_SEQ)\n",
+           payload_len - 2, TRACE_SPLITMIX_TOTAL_OVERHEAD);
+
+    if (cache_valid) {
+        const uint8_t *recv_prbs = payload_base + SEQ_BYTES + TRACE_SPLITMIX_TOTAL_OVERHEAD;
+        const uint8_t *exp_prbs = port_prbs_cache[port_id].cache_ext + prbs_off + TRACE_SPLITMIX_TOTAL_OVERHEAD;
+        uint16_t prbs_check_len = (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1)
+            ? total_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1 : 0;
+        printf("  PRBS check length: %u bytes\n", prbs_check_len);
+        printf("  Expected from: cache_ext[%" PRIu64 " + %u] = cache_ext[%" PRIu64 "]\n",
+               prbs_off, TRACE_SPLITMIX_TOTAL_OVERHEAD,
+               prbs_off + TRACE_SPLITMIX_TOTAL_OVERHEAD);
+
+        if (prbs_check_len > 0) {
+            // Show first 64 bytes of received vs expected
+            uint16_t show_len = (prbs_check_len < 64) ? prbs_check_len : 64;
+            printf("  RECV PRBS[0..%u]: ", show_len - 1);
+            for (uint16_t i = 0; i < show_len; i++) printf("%02x ", recv_prbs[i]);
+            printf("\n");
+            printf("  EXPD PRBS[0..%u]: ", show_len - 1);
+            for (uint16_t i = 0; i < show_len; i++) printf("%02x ", exp_prbs[i]);
+            printf("\n");
+
+            // Detailed comparison with mismatch positions
+            trace_compare("PRBS compare", recv_prbs, exp_prbs, prbs_check_len, 16);
+        } else {
+            printf("  *** PRBS check length is 0, nothing to verify ***\n");
+        }
+    } else {
+        printf("  *** SKIP: PRBS cache invalid for port %u ***\n", port_id);
+    }
+
+    // --- XOR Zone vs Raw PRBS comparison (VMC_2 transform olmadiysa ayni olmali) ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ XOR ZONE vs EXPECTED RAW PRBS (transform yoksa ayni olmali):\n");
+    if (cache_valid) {
+        const uint8_t *xor_zone = payload_base + SEQ_BYTES;  // payload[8..71]
+        const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;  // expected raw
+        trace_compare("XOR_ZONE vs RAW_PRBS", xor_zone, raw_prbs, 64, 8);
+    }
+
+    // --- DTN Sequence ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ DTN SEQUENCE:\n");
+    uint8_t dtn_actual = payload_base[payload_len - 1];
+    uint8_t dtn_expected = calc_dtn_seq(seq);
+    printf("  Actual:   %u (payload son byte, offset %u)\n", dtn_actual, payload_len - 1);
+    printf("  Expected: %u (calc_dtn_seq(%" PRIu64 "))\n", dtn_expected, seq);
+    printf("  Result:   %s\n", (dtn_actual == dtn_expected) ? "OK" : "*** MISMATCH ***");
+
+    // --- Summary ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    bool sm_ok_final = cache_valid ? trace_verify_splitmix64(payload_base, seq, port_id) : false;
+    bool prbs_ok_final = cache_valid ? trace_verify_prbs(payload_base, seq, port_id, total_prbs_len) : false;
+    printf("║ SUMMARY: CRC32C=%s  SPLIT64=%s  PRBS=%s  DTN=%s\n",
+           crc_ok ? "OK" : "FAIL",
+           sm_ok_final ? "OK" : "FAIL",
+           prbs_ok_final ? "OK" : "FAIL",
+           (dtn_actual == dtn_expected) ? "OK" : "FAIL");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 }
 
 #define SHOULD_TRACE_PACKET(port_id, vl_idx, seq) \
