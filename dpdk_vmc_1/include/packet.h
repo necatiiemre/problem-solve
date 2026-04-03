@@ -644,6 +644,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     printf("║ BEKLENEN  = biz TX verimize splitmix64+CRC uygulasaydik ne olmasi gerekirdi\n");
     printf("║\n");
 
+    int matching_method = -1;
     if (cache_valid) {
         const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;
         const uint8_t *rx_data = payload_base;
@@ -664,7 +665,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
         // 4 farkli yontemle dene, CRC eslesen yontemi bul
         uint8_t method_buf[4][76];
         const char *method_names[4] = {"Stateless", "Stateful", "Stateless+BSwap", "Stateful+BSwap"};
-        int matching_method = -1;
+        matching_method = -1;
 
         // Gelen CRC (iki endianness)
         uint32_t rx_crc_le = recv_crc;
@@ -760,13 +761,13 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
                rx_bek_same >= 72 ? "-> XOR zone eslesti, CRC endianness farki olabilir" :
                "-> ESLESMIYOR, cihaz farkli bir sey yapiyor");
 
-        bool sm_ok = (matching_method >= 0);
-        bool crc_either = crc_ok || crc_ok_swapped;
-
         #undef BSWAP64
     } else {
         printf("  *** SKIP: PRBS cache invalid for port %u ***\n", port_id);
     }
+
+    bool sm_ok = cache_valid ? (matching_method >= 0) : false;
+    bool crc_either = crc_ok || crc_ok_swapped;
 
     // --- PRBS Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
