@@ -276,6 +276,14 @@ static uint64_t _trace_count = 0;
 #define TRACE_SPLITMIX_CRC_BYTES   4
 #define TRACE_SPLITMIX_TOTAL_OVERHEAD (TRACE_SPLITMIX_XOR_BYTES + TRACE_SPLITMIX_CRC_BYTES)
 
+// splitmix64 sadece mix kismi (constant eklemeden)
+static inline uint64_t trace_splitmix64_mix_only(uint64_t x)
+{
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
 static inline uint64_t trace_splitmix64(uint64_t x)
 {
     x += 0x9E3779B97F4A7C15ULL;
@@ -662,26 +670,60 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             (((v) << 8) & 0xFF00000000ULL) | (((v) << 24) & 0xFF0000000000ULL) | \
             (((v) << 40) & 0xFF000000000000ULL) | (((v) << 56) & 0xFF00000000000000ULL))
 
-        // 4 farkli yontemle dene, CRC eslesen yontemi bul
-        uint8_t method_buf[4][76];
-        const char *method_names[4] = {"Stateless", "Stateful", "Stateless+BSwap", "Stateful+BSwap"};
+        // Farkli splitmix64 yontemlerini dene, CRC eslesen yontemi bul
+        #define NUM_METHODS 8
+        uint8_t method_buf[NUM_METHODS][76];
+        const char *method_names[NUM_METHODS] = {
+            "Stateless: sm64(seq+blk)",
+            "Stateful: sm64(st), st+=C (cift artirim!)",
+            "Stateful-dogru: st+=C, mix(st)",
+            "Stateful-dogru+BSwap",
+            "mix_only(seq+blk) (constant yok)",
+            "mix_only(seq*C + blk*C)",
+            "Stateless+BSwap: bswap(sm64(seq+blk))",
+            "sm64(seq) tekrar, her blok ayni XOR"
+        };
         matching_method = -1;
 
         // Gelen CRC (iki endianness)
         uint32_t rx_crc_le = recv_crc;
         uint32_t rx_crc_be = recv_crc_swapped;
 
-        for (int m = 0; m < 4; m++) {
+        for (int m = 0; m < NUM_METHODS; m++) {
             memcpy(method_buf[m], &seq, SEQ_BYTES);
             uint64_t st = seq;
             for (int blk = 0; blk < 8; blk++) {
                 uint64_t sm;
                 switch (m) {
-                    case 0: sm = trace_splitmix64(seq + (uint64_t)blk); break;
-                    case 1: sm = trace_splitmix64(st); st += 0x9E3779B97F4A7C15ULL; break;
-                    case 2: sm = BSWAP64(trace_splitmix64(seq + (uint64_t)blk)); break;
-                    case 3: sm = BSWAP64(trace_splitmix64(st)); st += 0x9E3779B97F4A7C15ULL; break;
+                    case 0: // Stateless: splitmix64(seq + blk)
+                        sm = trace_splitmix64(seq + (uint64_t)blk);
+                        break;
+                    case 1: // Stateful HATALI: sm64 icinde +C, disarida da +C
+                        sm = trace_splitmix64(st);
+                        st += 0x9E3779B97F4A7C15ULL;
+                        break;
+                    case 2: // Stateful DOGRU: st += C, sonra sadece mix
+                        st += 0x9E3779B97F4A7C15ULL;
+                        sm = trace_splitmix64_mix_only(st);
+                        break;
+                    case 3: // Stateful dogru + byte-swap
+                        st += 0x9E3779B97F4A7C15ULL;
+                        sm = BSWAP64(trace_splitmix64_mix_only(st));
+                        break;
+                    case 4: // mix_only(seq + blk) - constant ekleme yok
+                        sm = trace_splitmix64_mix_only(seq + (uint64_t)blk);
+                        break;
+                    case 5: // mix_only(seq*C + blk*C)
+                        sm = trace_splitmix64_mix_only((seq + (uint64_t)blk) * 0x9E3779B97F4A7C15ULL);
+                        break;
+                    case 6: // Stateless + byte-swap
+                        sm = BSWAP64(trace_splitmix64(seq + (uint64_t)blk));
+                        break;
+                    case 7: // Ayni sm deger her blok icin (sm64(seq))
+                        sm = trace_splitmix64(seq);
+                        break;
                 }
+                if (m == 2 || m == 3) { /* st zaten ilerletildi */ }
                 uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
                 uint64_t xored = prbs_val ^ sm;
                 memcpy(method_buf[m] + SEQ_BYTES + blk * 8, &xored, 8);
@@ -692,13 +734,14 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
 
             bool match_le = (crc == rx_crc_le);
             bool match_be = (crc == rx_crc_be);
-            printf("  Yontem %d (%s): CRC=0x%08X %s\n", m + 1, method_names[m], crc,
+            printf("  [%d] %-42s CRC=0x%08X %s\n", m + 1, method_names[m], crc,
                    match_le ? "<<< LE ESLESTI! >>>" :
-                   match_be ? "<<< BE ESLESTI! >>>" : "eslesmiyor");
+                   match_be ? "<<< BE ESLESTI! >>>" : "");
 
             if ((match_le || match_be) && matching_method < 0)
                 matching_method = m;
         }
+        #undef NUM_METHODS
 
         // Eslesen yontemi beklenen olarak kullan
         if (matching_method >= 0) {
