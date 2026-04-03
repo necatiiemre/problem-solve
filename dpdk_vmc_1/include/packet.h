@@ -677,50 +677,103 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     // --- Splitmix64 Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ SPLITMIX64 VERIFICATION:\n");
-    printf("  Mantik: raw_prbs ^ splitmix64(key) = beklenen\n");
+    printf("  Mantik: raw_prbs ^ splitmix64_stream = beklenen\n");
     printf("          beklenen == gelen_xor_zone ??\n");
 
     if (cache_valid) {
         const uint8_t *rx_xor_zone = payload_base + SEQ_BYTES;  // gelen [8..71]
-        const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;  // bizim PRBS
-        bool sm_ok = true;
+        const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;
 
-        printf("  Block-by-block (8 blocks x 8 bytes):\n");
+        // --- Yontem 1: Stateless (her blok icin splitmix64(seq+blk)) ---
+        bool stateless_ok = true;
+        printf("  [Yontem 1] STATELESS: splitmix64(seq+0), splitmix64(seq+1), ...\n");
         for (int blk = 0; blk < 8; blk++) {
-            uint64_t sm_key = seq + (uint64_t)blk;
-            uint64_t sm_val = trace_splitmix64(sm_key);
+            uint64_t sm_val = trace_splitmix64(seq + (uint64_t)blk);
             uint64_t rx_val, prbs_val;
             memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
             memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
-            uint64_t expected = prbs_val ^ sm_val;  // beklenen = PRBS ^ splitmix64
-            bool blk_ok = (expected == rx_val);
-            if (!blk_ok) sm_ok = false;
-            printf("    [blk %d] raw_prbs     = 0x%016" PRIX64 "  (bizim orijinal veri)\n", blk, prbs_val);
-            printf("            sm_val       = 0x%016" PRIX64 "  (splitmix64(seq+%d=%" PRIu64 "))\n",
-                   sm_val, blk, sm_key);
-            printf("            beklenen     = 0x%016" PRIX64 "  (raw_prbs ^ sm_val)\n", expected);
-            printf("            gelen        = 0x%016" PRIX64 "  (RX payload[%d..%d])\n",
-                   rx_val, SEQ_BYTES + blk * 8, SEQ_BYTES + blk * 8 + 7);
-            printf("            %s\n", blk_ok ? "OK - eslesiyor!" :
-                   "*** ESLESMIYOR - cihaz farkli transform kullaniyor ***");
+            uint64_t expected = prbs_val ^ sm_val;
+            if (expected != rx_val) stateless_ok = false;
         }
-        printf("  SPLIT64 Result: %s\n", sm_ok ? "OK" : "*** FAIL ***");
+        printf("    Sonuc: %s\n", stateless_ok ? "OK - ESLESTI!" : "ESLESMIYOR");
 
-        // Cihazin gercek XOR degerini hesapla (debug icin)
+        // --- Yontem 2: Stateful PRNG (state = seq, her adimda state += constant) ---
+        bool stateful_ok = true;
+        printf("  [Yontem 2] STATEFUL: state=seq, her blokta state += 0x9E3779B97F4A7C15\n");
+        uint64_t state = seq;
+        for (int blk = 0; blk < 8; blk++) {
+            uint64_t sm_val = trace_splitmix64(state);  // state + constant icerde eklenir
+            state = state + 0x9E3779B97F4A7C15ULL;  // bir sonraki blok icin state ilerlet
+            uint64_t rx_val, prbs_val;
+            memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
+            memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
+            uint64_t expected = prbs_val ^ sm_val;
+            if (expected != rx_val) stateful_ok = false;
+        }
+        printf("    Sonuc: %s\n", stateful_ok ? "OK - ESLESTI!" : "ESLESMIYOR");
+
+        // --- Yontem 3: Stateless byte-swapped (sm_val byte-reverse) ---
+        bool swapped_ok = true;
+        printf("  [Yontem 3] STATELESS + BYTE-SWAP: splitmix64 sonucu byte-reverse\n");
+        for (int blk = 0; blk < 8; blk++) {
+            uint64_t sm_val = trace_splitmix64(seq + (uint64_t)blk);
+            // byte-swap sm_val
+            uint64_t sm_swap = ((sm_val >> 56) & 0xFF) |
+                               ((sm_val >> 40) & 0xFF00) |
+                               ((sm_val >> 24) & 0xFF0000) |
+                               ((sm_val >> 8)  & 0xFF000000ULL) |
+                               ((sm_val << 8)  & 0xFF00000000ULL) |
+                               ((sm_val << 24) & 0xFF0000000000ULL) |
+                               ((sm_val << 40) & 0xFF000000000000ULL) |
+                               ((sm_val << 56) & 0xFF00000000000000ULL);
+            uint64_t rx_val, prbs_val;
+            memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
+            memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
+            uint64_t expected = prbs_val ^ sm_swap;
+            if (expected != rx_val) swapped_ok = false;
+        }
+        printf("    Sonuc: %s\n", swapped_ok ? "OK - ESLESTI!" : "ESLESMIYOR");
+
+        // --- Yontem 4: Stateful + byte-swapped ---
+        bool stateful_swap_ok = true;
+        printf("  [Yontem 4] STATEFUL + BYTE-SWAP\n");
+        state = seq;
+        for (int blk = 0; blk < 8; blk++) {
+            uint64_t sm_val = trace_splitmix64(state);
+            state = state + 0x9E3779B97F4A7C15ULL;
+            uint64_t sm_swap = ((sm_val >> 56) & 0xFF) |
+                               ((sm_val >> 40) & 0xFF00) |
+                               ((sm_val >> 24) & 0xFF0000) |
+                               ((sm_val >> 8)  & 0xFF000000ULL) |
+                               ((sm_val << 8)  & 0xFF00000000ULL) |
+                               ((sm_val << 24) & 0xFF0000000000ULL) |
+                               ((sm_val << 40) & 0xFF000000000000ULL) |
+                               ((sm_val << 56) & 0xFF00000000000000ULL);
+            uint64_t rx_val, prbs_val;
+            memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
+            memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
+            uint64_t expected = prbs_val ^ sm_swap;
+            if (expected != rx_val) stateful_swap_ok = false;
+        }
+        printf("    Sonuc: %s\n", stateful_swap_ok ? "OK - ESLESTI!" : "ESLESMIYOR");
+
+        // En iyi eslesen yontemi detayli goster
+        bool sm_ok = stateless_ok || stateful_ok || swapped_ok || stateful_swap_ok;
+        const char *method = stateless_ok ? "Stateless" :
+                             stateful_ok ? "Stateful" :
+                             swapped_ok ? "Stateless+ByteSwap" :
+                             stateful_swap_ok ? "Stateful+ByteSwap" : "HICBIRI";
+        printf("\n  >>> SONUC: %s %s <<<\n", method,
+               sm_ok ? "ESLESTI!" : "- hicbir yontem eslesmedi");
+
+        // Eslesmezse cihazin XOR degerlerini goster
         if (!sm_ok) {
-            printf("  ---- Cihazin gercek transform degerleri ----\n");
-            printf("  (gelen ^ raw_prbs = cihazin kullandigi XOR)\n");
+            printf("  ---- Cihazin gercek XOR degerleri (gelen ^ raw_prbs) ----\n");
             for (int blk = 0; blk < 8; blk++) {
                 uint64_t rx_val, prbs_val;
                 memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
                 memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
-                uint64_t device_xor = rx_val ^ prbs_val;
-                uint64_t sm_val = trace_splitmix64(seq + (uint64_t)blk);
-                printf("    [blk %d] cihaz_xor = 0x%016" PRIX64, blk, device_xor);
-                if (device_xor == sm_val)
-                    printf("  == bizim sm_val  ESIT!\n");
-                else
-                    printf("  != bizim sm_val(0x%016" PRIX64 ")\n", sm_val);
+                printf("    [blk %d] cihaz_xor = 0x%016" PRIX64 "\n", blk, rx_val ^ prbs_val);
             }
         }
     } else {
@@ -820,12 +873,20 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
         prbs_tx_ok = (saf_prbs_from_tx == 0) || (memcmp(r, e, saf_prbs_from_tx) == 0);
     }
 
+    bool crc_either = crc_ok || crc_ok_swapped;
+
     printf("║ SUMMARY:\n");
-    printf("║   CRC32C  = %s", crc_ok ? "OK" : "FAIL");
-    if (!crc_ok) printf("  (VMC_2 transform yok, beklenen)");
+    printf("║   CRC32C  = %s", crc_either ? "OK" : "FAIL");
+    if (crc_ok)
+        printf("  (little-endian, direkt eslesti)");
+    else if (crc_ok_swapped)
+        printf("  (big-endian, byte-swap ile eslesti)");
+    else
+        printf("  (eslesmedi)");
     printf("\n");
     printf("║   SPLIT64 = %s", sm_ok_final ? "OK" : "FAIL");
-    if (!sm_ok_final) printf("  (VMC_2 transform yok, beklenen)");
+    if (!sm_ok_final && crc_either)
+        printf("  (CRC dogru ama splitmix64 formulu eslesmiyor)");
     printf("\n");
     printf("║   PRBS    = %s", prbs_ok_final ? "OK" : "FAIL");
     if (!prbs_ok_final && prbs_tx_ok && total_extra > 0)
