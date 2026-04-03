@@ -615,41 +615,24 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     printf("  Cache port %u: %s\n", port_id,
            cache_valid ? "VALID" : "*** INVALID/UNINITIALIZED ***");
 
-    // --- CRC32C Verification ---
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ CRC32C VERIFICATION:\n");
-    printf("  Input: payload_base[0..71] = SEQ(8B) + XOR_ZONE(64B) = 72 bytes\n");
-    uint32_t calc_crc = trace_sw_crc32c(payload_base, SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES);
+    // --- Gelen CRC'yi oku (yontem testinde kullanilacak) ---
     uint32_t recv_crc;
     memcpy(&recv_crc, payload_base + SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES, sizeof(recv_crc));
-    bool crc_ok = (calc_crc == recv_crc);
-    // Endianness check: byte-swap recv_crc and compare
     uint32_t recv_crc_swapped = ((recv_crc >> 24) & 0xFF) |
                                  ((recv_crc >> 8) & 0xFF00) |
                                  ((recv_crc << 8) & 0xFF0000) |
                                  ((recv_crc << 24) & 0xFF000000);
-    bool crc_ok_swapped = (calc_crc == recv_crc_swapped);
-    printf("  Received CRC32C:  0x%08X (at payload offset 72)\n", recv_crc);
-    printf("  Calculated CRC:   0x%08X (over bytes [0..71])\n", calc_crc);
-    printf("  Byte-swapped CRC: 0x%08X (recv byte-reversed)\n", recv_crc_swapped);
-    if (crc_ok)
-        printf("  Result: OK\n");
-    else if (crc_ok_swapped)
-        printf("  Result: *** ENDIANNESS MISMATCH! ***\n"
-               "    CRC32C DEGERI DOGRU ama byte sirasi TERS!\n"
-               "    Cihaz BIG-ENDIAN yaziyor, biz LITTLE-ENDIAN okuyoruz.\n"
-               "    byte-swap yapilinca: 0x%08X == 0x%08X ESLESIR!\n",
-               recv_crc_swapped, calc_crc);
-    else
-        printf("  Result: *** FAIL (endian swap da eslesmedi) ***\n");
 
-    // --- 76 BYTE KARSILASTIRMA TABLOSU (TX ham, RX gelen, Beklenen) ---
+    // --- 76 BYTE KARSILASTIRMA ---
+    // Mantik: Biz TX verimize splitmix64+CRC uygulariz.
+    //         Sonucumuz gelen paketle ayniysa → cihaz dogru yapmis.
     printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║ 76 BYTE KARSILASTIRMA (SEQ:8 + XOR_ZONE:64 + CRC32C:4)\n");
+    printf("║ CIHAZ DOGRULAMA (76 BYTE: SEQ:8 + SM64:64 + CRC32C:4)\n");
     printf("║\n");
-    printf("║ TX HAM    = bizim gonderdigimiz orijinal paket (raw PRBS, transform yok)\n");
-    printf("║ RX GELEN  = cihazdan geri donen paket (splitmix64 + CRC uygulanmis)\n");
-    printf("║ BEKLENEN  = biz TX verimize splitmix64+CRC uygulasaydik ne olmasi gerekirdi\n");
+    printf("║ TX HAM   = bizim gonderdigimiz paket (raw PRBS)\n");
+    printf("║ BEKLENEN = TX verimize splitmix64+CRC kendimiz uygularsak ne olmali\n");
+    printf("║ RX GELEN = cihazdan donen paket\n");
+    printf("║ BEKLENEN == RX GELEN ise → cihaz DOGRU isledi\n");
     printf("║\n");
 
     int matching_method = -1;
@@ -814,7 +797,6 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     }
 
     bool sm_ok = cache_valid ? (matching_method >= 0) : false;
-    bool crc_either = crc_ok || crc_ok_swapped;
 
     // --- PRBS Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
@@ -878,15 +860,6 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
         printf("  *** SKIP: PRBS cache invalid for port %u ***\n", port_id);
     }
 
-    // --- XOR Zone vs Raw PRBS comparison (VMC_2 transform olmadiysa ayni olmali) ---
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ XOR ZONE vs EXPECTED RAW PRBS (transform yoksa ayni olmali):\n");
-    if (cache_valid) {
-        const uint8_t *xor_zone = payload_base + SEQ_BYTES;  // payload[8..71]
-        const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;  // expected raw
-        trace_compare("XOR_ZONE vs RAW_PRBS", xor_zone, raw_prbs, 64, 8);
-    }
-
     // --- DTN Sequence ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ DTN SEQUENCE:\n");
@@ -898,9 +871,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
 
     // --- Summary ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
-    bool prbs_ok_final = cache_valid ? trace_verify_prbs(payload_base, seq, port_id, total_prbs_len) : false;
-
-    // TX siniri icinde PRBS kontrolu (ekstra byte'lar haric)
+    // TX siniri icinde PRBS kontrolu
     bool prbs_tx_ok = false;
     if (cache_valid) {
         const uint8_t *r = payload_base + SEQ_BYTES + TRACE_SPLITMIX_TOTAL_OVERHEAD;
@@ -909,37 +880,15 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     }
 
     printf("║ SUMMARY:\n");
-    printf("║   CRC32C  = %s", crc_either ? "OK" : "FAIL");
-    if (crc_ok)
-        printf("  (little-endian, direkt eslesti)");
-    else if (crc_ok_swapped)
-        printf("  (big-endian, byte-swap ile eslesti)");
-    else
-        printf("  (eslesmedi)");
-    printf("\n");
-    printf("║   SPLIT64 = %s", sm_ok ? "OK" : "FAIL");
+    printf("║   SM64+CRC  = %s", sm_ok ? "OK" : "FAIL");
     if (sm_ok)
-        printf("  (CRC ile dogrulandi)");
-    else if (crc_either)
-        printf("  (CRC dogru ama hicbir splitmix64 yontemi eslesmiyor)");
+        printf("  (beklenen == gelen, cihaz DOGRU isledi)");
+    else
+        printf("  (hicbir yontem eslesmedi)");
     printf("\n");
-    printf("║   PRBS    = %s", prbs_ok_final ? "OK" : "FAIL");
-    if (!prbs_ok_final && prbs_tx_ok && total_extra > 0)
-        printf("  (SADECE cihaz/NIC ekstra byte'lari yuzunden FAIL!)");
-    else if (!prbs_ok_final && !prbs_tx_ok)
-        printf("  (*** GERCEK PRBS HATASI - TX verisi bozuk ***)");
-    printf("\n");
-    if (prbs_tx_ok && !prbs_ok_final)
-        printf("║   PRBS(TX siniri icinde) = OK  <-- VMC_1 verisi %u/%u byte dogru\n",
-               saf_prbs_from_tx, saf_prbs_from_tx);
-    printf("║   DTN_SEQ = %s\n", (dtn_actual == dtn_expected) ? "OK" : "FAIL");
-    if (total_extra > 0) {
-        printf("║\n");
-        printf("║   *** SONUC: Paket %u byte buyutulmus (cihaz:%u + NIC:%u) ***\n",
-               total_extra, device_added, nic_padding);
-        printf("║   *** PRBS FAIL sadece bu ekstra byte'lardan kaynakli. ***\n");
-        printf("║   *** VMC_1'in gonderdigi %u byte PRBS tamamen dogru. ***\n", saf_prbs_from_tx);
-    }
+    printf("║   PRBS [76+] = %s", prbs_tx_ok ? "OK" : "FAIL");
+    printf("  (%u/%u byte)\n", prbs_tx_ok ? saf_prbs_from_tx : 0, saf_prbs_from_tx);
+    printf("║   DTN_SEQ    = %s\n", (dtn_actual == dtn_expected) ? "OK" : "FAIL");
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 }
 
