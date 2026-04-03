@@ -677,32 +677,52 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     // --- Splitmix64 Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║ SPLITMIX64 VERIFICATION:\n");
-    printf("  XOR'd zone: payload[8..71] (64 bytes)\n");
-    printf("  Decode: decoded[i] = xored[i] ^ splitmix64(seq + i/8)\n");
+    printf("  Mantik: raw_prbs ^ splitmix64(key) = beklenen\n");
+    printf("          beklenen == gelen_xor_zone ??\n");
 
     if (cache_valid) {
-        const uint8_t *xored = payload_base + SEQ_BYTES;
-        const uint8_t *orig_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;
+        const uint8_t *rx_xor_zone = payload_base + SEQ_BYTES;  // gelen [8..71]
+        const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;  // bizim PRBS
         bool sm_ok = true;
 
         printf("  Block-by-block (8 blocks x 8 bytes):\n");
         for (int blk = 0; blk < 8; blk++) {
             uint64_t sm_key = seq + (uint64_t)blk;
             uint64_t sm_val = trace_splitmix64(sm_key);
-            uint64_t xored_val, orig_val;
-            memcpy(&xored_val, xored + blk * 8, sizeof(uint64_t));
-            memcpy(&orig_val, orig_prbs + blk * 8, sizeof(uint64_t));
-            uint64_t decoded = xored_val ^ sm_val;
-            bool blk_ok = (decoded == orig_val);
+            uint64_t rx_val, prbs_val;
+            memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
+            memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
+            uint64_t expected = prbs_val ^ sm_val;  // beklenen = PRBS ^ splitmix64
+            bool blk_ok = (expected == rx_val);
             if (!blk_ok) sm_ok = false;
-            printf("    [blk %d] sm_key=seq+%d=%" PRIu64 "\n", blk, blk, sm_key);
-            printf("            sm_val  = 0x%016" PRIX64 "\n", sm_val);
-            printf("            xored   = 0x%016" PRIX64 "\n", xored_val);
-            printf("            decoded = 0x%016" PRIX64 " (xored ^ sm_val)\n", decoded);
-            printf("            exp_prbs= 0x%016" PRIX64 " %s\n", orig_val,
-                   blk_ok ? "OK" : "*** MISMATCH ***");
+            printf("    [blk %d] raw_prbs     = 0x%016" PRIX64 "  (bizim orijinal veri)\n", blk, prbs_val);
+            printf("            sm_val       = 0x%016" PRIX64 "  (splitmix64(seq+%d=%" PRIu64 "))\n",
+                   sm_val, blk, sm_key);
+            printf("            beklenen     = 0x%016" PRIX64 "  (raw_prbs ^ sm_val)\n", expected);
+            printf("            gelen        = 0x%016" PRIX64 "  (RX payload[%d..%d])\n",
+                   rx_val, SEQ_BYTES + blk * 8, SEQ_BYTES + blk * 8 + 7);
+            printf("            %s\n", blk_ok ? "OK - eslesiyor!" :
+                   "*** ESLESMIYOR - cihaz farkli transform kullaniyor ***");
         }
         printf("  SPLIT64 Result: %s\n", sm_ok ? "OK" : "*** FAIL ***");
+
+        // Cihazin gercek XOR degerini hesapla (debug icin)
+        if (!sm_ok) {
+            printf("  ---- Cihazin gercek transform degerleri ----\n");
+            printf("  (gelen ^ raw_prbs = cihazin kullandigi XOR)\n");
+            for (int blk = 0; blk < 8; blk++) {
+                uint64_t rx_val, prbs_val;
+                memcpy(&rx_val, rx_xor_zone + blk * 8, sizeof(uint64_t));
+                memcpy(&prbs_val, raw_prbs + blk * 8, sizeof(uint64_t));
+                uint64_t device_xor = rx_val ^ prbs_val;
+                uint64_t sm_val = trace_splitmix64(seq + (uint64_t)blk);
+                printf("    [blk %d] cihaz_xor = 0x%016" PRIX64, blk, device_xor);
+                if (device_xor == sm_val)
+                    printf("  == bizim sm_val  ESIT!\n");
+                else
+                    printf("  != bizim sm_val(0x%016" PRIX64 ")\n", sm_val);
+            }
+        }
     } else {
         printf("  *** SKIP: PRBS cache invalid for port %u ***\n", port_id);
     }
