@@ -671,7 +671,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             (((v) << 40) & 0xFF000000000000ULL) | (((v) << 56) & 0xFF00000000000000ULL))
 
         // Farkli splitmix64 yontemlerini dene, CRC eslesen yontemi bul
-        #define NUM_METHODS 8
+        #define NUM_METHODS 9
         uint8_t method_buf[NUM_METHODS][76];
         const char *method_names[NUM_METHODS] = {
             "Stateless: sm64(seq+blk)",
@@ -681,7 +681,8 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             "mix_only(seq+blk) (constant yok)",
             "mix_only(seq*C + blk*C)",
             "Stateless+BSwap: bswap(sm64(seq+blk))",
-            "sm64(seq) tekrar, her blok ayni XOR"
+            "sm64(seq) tekrar, her blok ayni XOR",
+            "*** bswap(sm64(blk)) - seq yok, sabit XOR ***"
         };
         matching_method = -1;
 
@@ -721,6 +722,9 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
                         break;
                     case 7: // Ayni sm deger her blok icin (sm64(seq))
                         sm = trace_splitmix64(seq);
+                        break;
+                    case 8: // seq'i yok say, sadece blk indeksi (sabit XOR)
+                        sm = BSWAP64(trace_splitmix64((uint64_t)blk));
                         break;
                 }
                 if (m == 2 || m == 3) { /* st zaten ilerletildi */ }
