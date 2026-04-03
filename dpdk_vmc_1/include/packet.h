@@ -574,7 +574,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     // Memory layout
     printf("║ PAYLOAD MEMORY MAP:\n");
     printf("  [%u..%u]     SEQ            (8 bytes)\n", 0, 7);
-    printf("  [%u..%u]    XOR zone       (64 bytes) - splitmix64 XOR alani\n", 8, 71);
+    printf("  [%u..%u]    SPLITMIX64     (64 bytes) - splitmix64 ile XOR'lanmis alan\n", 8, 71);
     printf("  [%u..%u]    CRC32C         (4 bytes)\n", 72, 75);
     uint16_t saf_prbs_from_tx = tx_prbs_len - TRACE_SPLITMIX_TOTAL_OVERHEAD - 1;
     uint16_t saf_prbs_from_pkt = (total_prbs_len > TRACE_SPLITMIX_TOTAL_OVERHEAD + 1) ?
@@ -735,7 +735,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
 
             const char *alan;
             if (i < 8) alan = "SEQ";
-            else if (i < 72) alan = "XOR";
+            else if (i < 72) alan = "SM64";
             else alan = "CRC";
 
             printf("  [%4d]    0x%02x     0x%02x      0x%02x     %s    %s    %s   %s\n",
