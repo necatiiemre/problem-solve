@@ -635,143 +635,133 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     else
         printf("  Result: *** FAIL (endian swap da eslesmedi) ***\n");
 
-    // --- TX vs RX ilk 72 byte karsilastirmasi ---
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ PAYLOAD ILK 72 BYTE (SEQ + XOR ZONE) DETAY:\n");
-    if (cache_valid) {
-        const uint8_t *rx_data = payload_base;
-        const uint8_t *tx_prbs_data = port_prbs_cache[port_id].cache_ext + prbs_off;
-        // TX payload: [SEQ(8)] + [raw PRBS(64)] = 72 byte
-        // RX payload: [SEQ(8)] + [XOR'd data(64)] = 72 byte
-        printf("  offset  TX(PRBS)  RX(gelen)   XOR     Durum\n");
-        printf("  ------  --------  ---------  ------   -----\n");
-        // SEQ bytes (0-7): bunlar her iki tarafta da ayni olmali
-        for (int i = 0; i < 8; i++) {
-            uint8_t tx_byte = (i < (int)sizeof(seq)) ? ((uint8_t *)&seq)[i] : 0;
-            uint8_t rx_byte = rx_data[i];
-            printf("  [%4d]    0x%02x      0x%02x      0x%02x    %s  (SEQ)\n",
-                   i, tx_byte, rx_byte, tx_byte ^ rx_byte,
-                   (tx_byte == rx_byte) ? "OK" : "FARKLI");
-        }
-        printf("  ------  --------  ---------  ------   ----- (XOR zone baslangici)\n");
-        // XOR zone bytes (8-71): TX'te raw PRBS, RX'te transform edilmis
-        int diff_count = 0;
-        for (int i = 0; i < 64; i++) {
-            uint8_t tx_byte = tx_prbs_data[i];
-            uint8_t rx_byte = rx_data[SEQ_BYTES + i];
-            bool same = (tx_byte == rx_byte);
-            if (!same) diff_count++;
-            printf("  [%4d]    0x%02x      0x%02x      0x%02x    %s\n",
-                   SEQ_BYTES + i, tx_byte, rx_byte, tx_byte ^ rx_byte,
-                   same ? "AYNI" : "FARKLI");
-        }
-        printf("  ------  --------  ---------  ------   -----\n");
-        if (diff_count == 0)
-            printf("  XOR zone: TX ile RX AYNI -> cihaz transform YAPMAMIS\n");
-        else if (diff_count == 64)
-            printf("  XOR zone: 64/64 byte FARKLI -> cihaz transform UYGULADI!\n");
-        else
-            printf("  XOR zone: %d/64 byte farkli -> KISMI degisiklik\n", diff_count);
-    }
-
-    // --- Splitmix64 + CRC32C Verification ---
-    // Mantik: Biz raw_prbs'i biliyoruz, splitmix64 uygulayip CRC hesaplariz.
-    // Bizim CRC == gelen CRC ise → formul DOGRU.
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-    printf("║ SPLITMIX64 + CRC32C BIRLESIK DOGRULAMA:\n");
-    printf("  Mantik:\n");
-    printf("    1) raw_prbs ^ splitmix64 = expected_xor_zone\n");
-    printf("    2) crc32c(SEQ + expected_xor_zone) = expected_crc\n");
-    printf("    3) expected_crc == gelen_crc ise → formul DOGRU\n");
+    // --- 76 BYTE KARSILASTIRMA TABLOSU (TX ham, RX gelen, Beklenen) ---
+    printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║ 76 BYTE KARSILASTIRMA (SEQ:8 + XOR_ZONE:64 + CRC32C:4)\n");
+    printf("║\n");
+    printf("║ TX HAM    = bizim gonderdigimiz orijinal paket (raw PRBS, transform yok)\n");
+    printf("║ RX GELEN  = cihazdan geri donen paket (splitmix64 + CRC uygulanmis)\n");
+    printf("║ BEKLENEN  = biz TX verimize splitmix64+CRC uygulasaydik ne olmasi gerekirdi\n");
+    printf("║\n");
 
     if (cache_valid) {
         const uint8_t *raw_prbs = port_prbs_cache[port_id].cache_ext + prbs_off;
+        const uint8_t *rx_data = payload_base;
 
-        // Gelen CRC (iki endianness)
-        uint32_t rx_crc_le = recv_crc;  // little-endian olarak okundu
-        uint32_t rx_crc_be = recv_crc_swapped;  // byte-swap
+        // Beklenen 76 byte'i olustur: SEQ(8) + splitmix64(64) + CRC32C(4)
+        uint8_t expected_76[76];
 
-        // Her yontem icin: XOR uygula, 72 byte olustur, CRC hesapla, karsilastir
-        uint8_t test_buf[72];  // SEQ(8) + XOR_ZONE(64)
-        memcpy(test_buf, payload_base, SEQ_BYTES);  // SEQ her zaman ayni
+        // SEQ (8 byte) - aynen kopyala
+        memcpy(expected_76, &seq, SEQ_BYTES);
 
+        // Splitmix64 XOR uygula (stateless: splitmix64(seq+blk))
         #define BSWAP64(v) ( \
             (((v) >> 56) & 0xFFULL) | (((v) >> 40) & 0xFF00ULL) | \
             (((v) >> 24) & 0xFF0000ULL) | (((v) >> 8) & 0xFF000000ULL) | \
             (((v) << 8) & 0xFF00000000ULL) | (((v) << 24) & 0xFF0000000000ULL) | \
             (((v) << 40) & 0xFF000000000000ULL) | (((v) << 56) & 0xFF00000000000000ULL))
 
-        // --- Yontem 1: Stateless ---
-        for (int blk = 0; blk < 8; blk++) {
-            uint64_t sm = trace_splitmix64(seq + (uint64_t)blk);
-            uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
-            uint64_t xored = prbs_val ^ sm;
-            memcpy(test_buf + SEQ_BYTES + blk * 8, &xored, 8);
-        }
-        uint32_t crc1 = trace_sw_crc32c(test_buf, 72);
-        bool m1 = (crc1 == rx_crc_le) || (crc1 == rx_crc_be);
-        printf("  [1] Stateless:         CRC=0x%08X  %s\n", crc1,
-               m1 ? "<<< ESLESTI! >>>" : "eslesmiyor");
+        // 4 farkli yontemle dene, CRC eslesen yontemi bul
+        uint8_t method_buf[4][76];
+        const char *method_names[4] = {"Stateless", "Stateful", "Stateless+BSwap", "Stateful+BSwap"};
+        int matching_method = -1;
 
-        // --- Yontem 2: Stateful ---
-        uint64_t state = seq;
-        for (int blk = 0; blk < 8; blk++) {
-            uint64_t sm = trace_splitmix64(state);
-            state += 0x9E3779B97F4A7C15ULL;
-            uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
-            uint64_t xored = prbs_val ^ sm;
-            memcpy(test_buf + SEQ_BYTES + blk * 8, &xored, 8);
-        }
-        uint32_t crc2 = trace_sw_crc32c(test_buf, 72);
-        bool m2 = (crc2 == rx_crc_le) || (crc2 == rx_crc_be);
-        printf("  [2] Stateful:          CRC=0x%08X  %s\n", crc2,
-               m2 ? "<<< ESLESTI! >>>" : "eslesmiyor");
+        // Gelen CRC (iki endianness)
+        uint32_t rx_crc_le = recv_crc;
+        uint32_t rx_crc_be = recv_crc_swapped;
 
-        // --- Yontem 3: Stateless + byte-swap ---
-        for (int blk = 0; blk < 8; blk++) {
-            uint64_t sm = BSWAP64(trace_splitmix64(seq + (uint64_t)blk));
-            uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
-            uint64_t xored = prbs_val ^ sm;
-            memcpy(test_buf + SEQ_BYTES + blk * 8, &xored, 8);
-        }
-        uint32_t crc3 = trace_sw_crc32c(test_buf, 72);
-        bool m3 = (crc3 == rx_crc_le) || (crc3 == rx_crc_be);
-        printf("  [3] Stateless+BSwap:   CRC=0x%08X  %s\n", crc3,
-               m3 ? "<<< ESLESTI! >>>" : "eslesmiyor");
-
-        // --- Yontem 4: Stateful + byte-swap ---
-        state = seq;
-        for (int blk = 0; blk < 8; blk++) {
-            uint64_t sm = BSWAP64(trace_splitmix64(state));
-            state += 0x9E3779B97F4A7C15ULL;
-            uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
-            uint64_t xored = prbs_val ^ sm;
-            memcpy(test_buf + SEQ_BYTES + blk * 8, &xored, 8);
-        }
-        uint32_t crc4 = trace_sw_crc32c(test_buf, 72);
-        bool m4 = (crc4 == rx_crc_le) || (crc4 == rx_crc_be);
-        printf("  [4] Stateful+BSwap:    CRC=0x%08X  %s\n", crc4,
-               m4 ? "<<< ESLESTI! >>>" : "eslesmiyor");
-
-        printf("  Gelen CRC (LE): 0x%08X  Gelen CRC (BE): 0x%08X\n", rx_crc_le, rx_crc_be);
-
-        bool sm_ok = m1 || m2 || m3 || m4;
-        const char *method = m1 ? "Stateless" : m2 ? "Stateful" :
-                             m3 ? "Stateless+BSwap" : m4 ? "Stateful+BSwap" : "HICBIRI";
-        printf("\n  >>> SONUC: %s %s <<<\n", method,
-               sm_ok ? "ESLESTI!" : "- hicbir yontem eslesmedi");
-
-        // Eslesmezse detay goster
-        if (!sm_ok) {
-            printf("  ---- Cihazin gercek XOR degerleri (gelen ^ raw_prbs) ----\n");
-            const uint8_t *rx_xor = payload_base + SEQ_BYTES;
+        for (int m = 0; m < 4; m++) {
+            memcpy(method_buf[m], &seq, SEQ_BYTES);
+            uint64_t st = seq;
             for (int blk = 0; blk < 8; blk++) {
-                uint64_t rx_val, prbs_val;
-                memcpy(&rx_val, rx_xor + blk * 8, 8);
-                memcpy(&prbs_val, raw_prbs + blk * 8, 8);
-                printf("    [blk %d] cihaz_xor = 0x%016" PRIX64 "\n", blk, rx_val ^ prbs_val);
+                uint64_t sm;
+                switch (m) {
+                    case 0: sm = trace_splitmix64(seq + (uint64_t)blk); break;
+                    case 1: sm = trace_splitmix64(st); st += 0x9E3779B97F4A7C15ULL; break;
+                    case 2: sm = BSWAP64(trace_splitmix64(seq + (uint64_t)blk)); break;
+                    case 3: sm = BSWAP64(trace_splitmix64(st)); st += 0x9E3779B97F4A7C15ULL; break;
+                }
+                uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
+                uint64_t xored = prbs_val ^ sm;
+                memcpy(method_buf[m] + SEQ_BYTES + blk * 8, &xored, 8);
             }
+            // CRC32C hesapla ve yaz
+            uint32_t crc = trace_sw_crc32c(method_buf[m], 72);
+            memcpy(method_buf[m] + 72, &crc, 4);
+
+            bool match_le = (crc == rx_crc_le);
+            bool match_be = (crc == rx_crc_be);
+            printf("  Yontem %d (%s): CRC=0x%08X %s\n", m + 1, method_names[m], crc,
+                   match_le ? "<<< LE ESLESTI! >>>" :
+                   match_be ? "<<< BE ESLESTI! >>>" : "eslesmiyor");
+
+            if ((match_le || match_be) && matching_method < 0)
+                matching_method = m;
         }
+
+        // Eslesen yontemi beklenen olarak kullan
+        if (matching_method >= 0) {
+            memcpy(expected_76, method_buf[matching_method], 76);
+            printf("\n  >>> Eslesen yontem: %s (yontem %d) <<<\n\n",
+                   method_names[matching_method], matching_method + 1);
+        } else {
+            // Hicbiri eslesmediyse stateless'i default goster
+            memcpy(expected_76, method_buf[0], 76);
+            printf("\n  >>> HICBIR YONTEM ESLESMEDI - stateless gosteriliyor <<<\n\n");
+        }
+
+        // TX ham 76 byte olustur (SEQ + raw PRBS + raw PRBS[64..67] as "CRC" area)
+        uint8_t tx_76[76];
+        memcpy(tx_76, &seq, SEQ_BYTES);
+        memcpy(tx_76 + SEQ_BYTES, raw_prbs, 68);  // 64 XOR zone + 4 CRC alani (raw PRBS)
+
+        // RX gelen 76 byte
+        const uint8_t *rx_76 = rx_data;  // zaten payload_base
+
+        // Tablo basligi
+        printf("  offset   TX HAM   RX GELEN  BEKLENEN   TX=RX  TX=BEK  RX=BEK  Alan\n");
+        printf("  ------   ------   --------  --------   -----  ------  ------  ----\n");
+
+        int tx_rx_same = 0, tx_bek_same = 0, rx_bek_same = 0;
+        for (int i = 0; i < 76; i++) {
+            uint8_t tx = tx_76[i];
+            uint8_t rx = rx_76[i];
+            uint8_t bek = expected_76[i];
+            bool tr = (tx == rx), tb = (tx == bek), rb = (rx == bek);
+            if (tr) tx_rx_same++;
+            if (tb) tx_bek_same++;
+            if (rb) rx_bek_same++;
+
+            const char *alan;
+            if (i < 8) alan = "SEQ";
+            else if (i < 72) alan = "XOR";
+            else alan = "CRC";
+
+            printf("  [%4d]    0x%02x     0x%02x      0x%02x     %s    %s    %s   %s\n",
+                   i, tx, rx, bek,
+                   tr ? " ==" : " !=",
+                   tb ? " ==" : " !=",
+                   rb ? " ==" : " !=",
+                   alan);
+        }
+        printf("  ------   ------   --------  --------   -----  ------  ------\n");
+        printf("  TOPLAM                                 %2d/76  %2d/76  %2d/76\n",
+               tx_rx_same, tx_bek_same, rx_bek_same);
+        printf("\n");
+        printf("  TX=RX:  %d/76 %s\n", tx_rx_same,
+               tx_rx_same == 76 ? "-> cihaz hic degistirmemis" :
+               tx_rx_same == 8  ? "-> sadece SEQ ayni, XOR+CRC degismis (beklenen)" :
+               "-> kismi degisiklik");
+        printf("  TX=BEK: %d/76 %s\n", tx_bek_same,
+               tx_bek_same == 8 ? "-> sadece SEQ ayni (beklenen, transform uygulandigi icin)" :
+               "-> ??");
+        printf("  RX=BEK: %d/76 %s\n", rx_bek_same,
+               rx_bek_same == 76 ? "-> MUKEMMEL! Cihaz bizim bekledigimiz gibi transform yapmis!" :
+               rx_bek_same >= 72 ? "-> XOR zone eslesti, CRC endianness farki olabilir" :
+               "-> ESLESMIYOR, cihaz farkli bir sey yapiyor");
+
+        bool sm_ok = (matching_method >= 0);
+        bool crc_either = crc_ok || crc_ok_swapped;
 
         #undef BSWAP64
     } else {
@@ -860,7 +850,6 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
 
     // --- Summary ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
-    bool sm_ok_final = cache_valid ? trace_verify_splitmix64(payload_base, seq, port_id) : false;
     bool prbs_ok_final = cache_valid ? trace_verify_prbs(payload_base, seq, port_id, total_prbs_len) : false;
 
     // TX siniri icinde PRBS kontrolu (ekstra byte'lar haric)
@@ -871,8 +860,6 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
         prbs_tx_ok = (saf_prbs_from_tx == 0) || (memcmp(r, e, saf_prbs_from_tx) == 0);
     }
 
-    bool crc_either = crc_ok || crc_ok_swapped;
-
     printf("║ SUMMARY:\n");
     printf("║   CRC32C  = %s", crc_either ? "OK" : "FAIL");
     if (crc_ok)
@@ -882,9 +869,11 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     else
         printf("  (eslesmedi)");
     printf("\n");
-    printf("║   SPLIT64 = %s", sm_ok_final ? "OK" : "FAIL");
-    if (!sm_ok_final && crc_either)
-        printf("  (CRC dogru ama splitmix64 formulu eslesmiyor)");
+    printf("║   SPLIT64 = %s", sm_ok ? "OK" : "FAIL");
+    if (sm_ok)
+        printf("  (CRC ile dogrulandi)");
+    else if (crc_either)
+        printf("  (CRC dogru ama hicbir splitmix64 yontemi eslesmiyor)");
     printf("\n");
     printf("║   PRBS    = %s", prbs_ok_final ? "OK" : "FAIL");
     if (!prbs_ok_final && prbs_tx_ok && total_extra > 0)
