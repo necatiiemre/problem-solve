@@ -615,9 +615,64 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
     uint32_t recv_crc;
     memcpy(&recv_crc, payload_base + SEQ_BYTES + TRACE_SPLITMIX_XOR_BYTES, sizeof(recv_crc));
     bool crc_ok = (calc_crc == recv_crc);
-    printf("  Received CRC32C: 0x%08X (at payload offset 72)\n", recv_crc);
-    printf("  Calculated CRC:  0x%08X\n", calc_crc);
-    printf("  Result: %s\n", crc_ok ? "OK" : "*** FAIL ***");
+    // Endianness check: byte-swap recv_crc and compare
+    uint32_t recv_crc_swapped = ((recv_crc >> 24) & 0xFF) |
+                                 ((recv_crc >> 8) & 0xFF00) |
+                                 ((recv_crc << 8) & 0xFF0000) |
+                                 ((recv_crc << 24) & 0xFF000000);
+    bool crc_ok_swapped = (calc_crc == recv_crc_swapped);
+    printf("  Received CRC32C:  0x%08X (at payload offset 72)\n", recv_crc);
+    printf("  Calculated CRC:   0x%08X (over bytes [0..71])\n", calc_crc);
+    printf("  Byte-swapped CRC: 0x%08X (recv byte-reversed)\n", recv_crc_swapped);
+    if (crc_ok)
+        printf("  Result: OK\n");
+    else if (crc_ok_swapped)
+        printf("  Result: *** ENDIANNESS MISMATCH! ***\n"
+               "    CRC32C DEGERI DOGRU ama byte sirasi TERS!\n"
+               "    Cihaz BIG-ENDIAN yaziyor, biz LITTLE-ENDIAN okuyoruz.\n"
+               "    byte-swap yapilinca: 0x%08X == 0x%08X ESLESIR!\n",
+               recv_crc_swapped, calc_crc);
+    else
+        printf("  Result: *** FAIL (endian swap da eslesmedi) ***\n");
+
+    // --- TX vs RX ilk 72 byte karsilastirmasi ---
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ PAYLOAD ILK 72 BYTE (SEQ + XOR ZONE) DETAY:\n");
+    if (cache_valid) {
+        const uint8_t *rx_data = payload_base;
+        const uint8_t *tx_prbs_data = port_prbs_cache[port_id].cache_ext + prbs_off;
+        // TX payload: [SEQ(8)] + [raw PRBS(64)] = 72 byte
+        // RX payload: [SEQ(8)] + [XOR'd data(64)] = 72 byte
+        printf("  offset  TX(PRBS)  RX(gelen)   XOR     Durum\n");
+        printf("  ------  --------  ---------  ------   -----\n");
+        // SEQ bytes (0-7): bunlar her iki tarafta da ayni olmali
+        for (int i = 0; i < 8; i++) {
+            uint8_t tx_byte = (i < (int)sizeof(seq)) ? ((uint8_t *)&seq)[i] : 0;
+            uint8_t rx_byte = rx_data[i];
+            printf("  [%4d]    0x%02x      0x%02x      0x%02x    %s  (SEQ)\n",
+                   i, tx_byte, rx_byte, tx_byte ^ rx_byte,
+                   (tx_byte == rx_byte) ? "OK" : "FARKLI");
+        }
+        printf("  ------  --------  ---------  ------   ----- (XOR zone baslangici)\n");
+        // XOR zone bytes (8-71): TX'te raw PRBS, RX'te transform edilmis
+        int diff_count = 0;
+        for (int i = 0; i < 64; i++) {
+            uint8_t tx_byte = tx_prbs_data[i];
+            uint8_t rx_byte = rx_data[SEQ_BYTES + i];
+            bool same = (tx_byte == rx_byte);
+            if (!same) diff_count++;
+            printf("  [%4d]    0x%02x      0x%02x      0x%02x    %s\n",
+                   SEQ_BYTES + i, tx_byte, rx_byte, tx_byte ^ rx_byte,
+                   same ? "AYNI" : "FARKLI");
+        }
+        printf("  ------  --------  ---------  ------   -----\n");
+        if (diff_count == 0)
+            printf("  XOR zone: TX ile RX AYNI -> cihaz transform YAPMAMIS\n");
+        else if (diff_count == 64)
+            printf("  XOR zone: 64/64 byte FARKLI -> cihaz transform UYGULADI!\n");
+        else
+            printf("  XOR zone: %d/64 byte farkli -> KISMI degisiklik\n", diff_count);
+    }
 
     // --- Splitmix64 Verification ---
     printf("╠══════════════════════════════════════════════════════════════╣\n");
