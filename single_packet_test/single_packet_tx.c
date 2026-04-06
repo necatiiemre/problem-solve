@@ -106,15 +106,16 @@ static inline uint8_t calc_dtn_seq(uint64_t seq)
 // ==========================================
 static uint16_t ip_checksum(const void *data, int len)
 {
-    const uint16_t *p = (const uint16_t *)data;
+    const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
-    for (int i = 0; i < len / 2; i++)
-        sum += ntohs(p[i]);
+    for (int i = 0; i < len - 1; i += 2)
+        sum += (p[i] << 8) | p[i + 1];
     if (len & 1)
-        sum += ((const uint8_t *)data)[len - 1] << 8;
+        sum += p[len - 1] << 8;
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
-    return htons(~sum & 0xFFFF);
+    uint16_t result = ~sum & 0xFFFF;
+    return htons(result);
 }
 
 // ==========================================
@@ -173,8 +174,7 @@ static void build_packet(uint8_t *pkt, uint64_t seq)
     // IP checksum
     ip[10] = 0; ip[11] = 0;
     uint16_t cksum = ip_checksum(ip, IP_HDR_LEN);
-    ip[10] = (cksum >> 8) & 0xFF;
-    ip[11] = cksum & 0xFF;
+    memcpy(ip + 10, &cksum, 2);
     offset += IP_HDR_LEN;  // 38
 
     // --- UDP Header (8 bytes) ---
