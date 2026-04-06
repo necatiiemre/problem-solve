@@ -654,7 +654,7 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             (((v) << 40) & 0xFF000000000000ULL) | (((v) << 56) & 0xFF00000000000000ULL))
 
         // Farkli splitmix64 yontemlerini dene, CRC eslesen yontemi bul
-        #define NUM_METHODS 13
+        #define NUM_METHODS 14
         uint8_t method_buf[NUM_METHODS][76];
         const char *method_names[NUM_METHODS] = {
             "sm64(seq+blk)",
@@ -666,10 +666,11 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             "bswap(sm64(seq+blk))",
             "sm64(seq) tekrar",
             "bswap(sm64(blk)) seq yok",
-            "*** bswap(sm64(bswap(seq)+blk)) SEQ big-endian ***",
-            "*** sm64(bswap(seq)+blk) SEQ big-endian ***",
-            "*** bswap(sm64(bswap(seq))) + stateful ***",
-            "*** sm64(bswap(seq)) + stateful ***"
+            "bswap(sm64(bswap(seq)+blk)) SEQ big-endian",
+            "sm64(bswap(seq)+blk) SEQ big-endian",
+            "bswap(sm64(bswap(seq))) + stateful",
+            "sm64(bswap(seq)) + stateful",
+            "*** bswap(sm64(8*bswap(seq)+i)) CIHAZ FORMULU ***"
         };
         matching_method = -1;
 
@@ -733,6 +734,11 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
                         if (blk == 0) st = BSWAP64(seq);
                         sm = trace_splitmix64(st);
                         st += 0x9E3779B97F4A7C15ULL;
+                        break;
+                    }
+                    case 13: { // CIHAZ FORMULU: bswap(sm64(8 * bswap(seq) + i))
+                        uint64_t seq_be = BSWAP64(seq);
+                        sm = BSWAP64(trace_splitmix64(8 * seq_be + (uint64_t)blk));
                         break;
                     }
                 }
