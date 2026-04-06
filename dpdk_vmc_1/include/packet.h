@@ -654,18 +654,22 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             (((v) << 40) & 0xFF000000000000ULL) | (((v) << 56) & 0xFF00000000000000ULL))
 
         // Farkli splitmix64 yontemlerini dene, CRC eslesen yontemi bul
-        #define NUM_METHODS 9
+        #define NUM_METHODS 13
         uint8_t method_buf[NUM_METHODS][76];
         const char *method_names[NUM_METHODS] = {
-            "Stateless: sm64(seq+blk)",
-            "Stateful: sm64(st), st+=C (cift artirim!)",
-            "Stateful-dogru: st+=C, mix(st)",
-            "Stateful-dogru+BSwap",
-            "mix_only(seq+blk) (constant yok)",
-            "mix_only(seq*C + blk*C)",
-            "Stateless+BSwap: bswap(sm64(seq+blk))",
-            "sm64(seq) tekrar, her blok ayni XOR",
-            "*** bswap(sm64(blk)) - seq yok, sabit XOR ***"
+            "sm64(seq+blk)",
+            "sm64(st), st+=C (cift artirim)",
+            "st+=C, mix(st)",
+            "bswap(st+=C, mix(st))",
+            "mix_only(seq+blk)",
+            "mix_only((seq+blk)*C)",
+            "bswap(sm64(seq+blk))",
+            "sm64(seq) tekrar",
+            "bswap(sm64(blk)) seq yok",
+            "*** bswap(sm64(bswap(seq)+blk)) SEQ big-endian ***",
+            "*** sm64(bswap(seq)+blk) SEQ big-endian ***",
+            "*** bswap(sm64(bswap(seq))) + stateful ***",
+            "*** sm64(bswap(seq)) + stateful ***"
         };
         matching_method = -1;
 
@@ -709,6 +713,28 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
                     case 8: // seq'i yok say, sadece blk indeksi (sabit XOR)
                         sm = BSWAP64(trace_splitmix64((uint64_t)blk));
                         break;
+                    case 9: { // SEQ big-endian + bswap sm64 output
+                        uint64_t seq_be = BSWAP64(seq);
+                        sm = BSWAP64(trace_splitmix64(seq_be + (uint64_t)blk));
+                        break;
+                    }
+                    case 10: { // SEQ big-endian + normal sm64 output
+                        uint64_t seq_be = BSWAP64(seq);
+                        sm = trace_splitmix64(seq_be + (uint64_t)blk);
+                        break;
+                    }
+                    case 11: { // SEQ big-endian + stateful + bswap
+                        if (blk == 0) st = BSWAP64(seq);
+                        sm = BSWAP64(trace_splitmix64(st));
+                        st += 0x9E3779B97F4A7C15ULL;
+                        break;
+                    }
+                    case 12: { // SEQ big-endian + stateful
+                        if (blk == 0) st = BSWAP64(seq);
+                        sm = trace_splitmix64(st);
+                        st += 0x9E3779B97F4A7C15ULL;
+                        break;
+                    }
                 }
                 if (m == 2 || m == 3) { /* st zaten ilerletildi */ }
                 uint64_t prbs_val; memcpy(&prbs_val, raw_prbs + blk * 8, 8);
