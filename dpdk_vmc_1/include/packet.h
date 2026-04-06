@@ -749,10 +749,17 @@ static inline void trace_print_packet(const char *stage, const uint8_t *pkt,
             }
             // CRC32C hesapla ve yaz
             uint32_t crc = trace_sw_crc32c(method_buf[m], 72);
-            memcpy(method_buf[m] + 72, &crc, 4);
-
+            // CRC'yi hem LE hem BE olarak sakla, eslesen yonteme gore secilecek
             bool match_le = (crc == rx_crc_le);
             bool match_be = (crc == rx_crc_be);
+            if (match_be) {
+                // Cihaz big-endian yaziyor, biz de oyle yazalim
+                uint32_t crc_be = ((crc >> 24) & 0xFF) | ((crc >> 8) & 0xFF00) |
+                                   ((crc << 8) & 0xFF0000) | ((crc << 24) & 0xFF000000);
+                memcpy(method_buf[m] + 72, &crc_be, 4);
+            } else {
+                memcpy(method_buf[m] + 72, &crc, 4);
+            }
             printf("  [%d] %-42s CRC=0x%08X %s\n", m + 1, method_names[m], crc,
                    match_le ? "<<< LE ESLESTI! >>>" :
                    match_be ? "<<< BE ESLESTI! >>>" : "");
